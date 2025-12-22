@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.2"
+# XBUILD_VERSION="0.0.3"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Defaults (override via environment) --------
@@ -20,6 +20,9 @@
 : "${XBUILD_ASSUME_YES:=0}"            # 1 skips prompts for destructive actions
 : "${XBUILD_STRICT:=1}"                # 1 enables stricter checks
 : "${XBUILD_FORCE:=0}"                 # 1 allows file collisions with installed packages
+: "${XBUILD_UNPRIVILEGED_BUILD:=1}"    # 1 runs build/install steps as unprivileged user when possible
+: "${XBUILD_BUILD_USER:=nobody}"       # user for unprivileged build when running as root
+: "${XBUILD_ALLOW_ROOT_RECIPES:=0}"    # 1 allows running recipe code as root if unprivileged build is unavailable
 
 umask "$XBUILD_UMASK" 2>/dev/null || :
 
@@ -217,6 +220,39 @@ run_strict() {
     return $rc
 }
 
+should_drop_privs() {
+    # Returns 0 if we should run build commands as unprivileged user (when running as root)
+    [ "${XBUILD_UNPRIVILEGED_BUILD:-0}" = "1" ] || return 1
+    [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] || return 1
+    return 0
+}
+
+assert_build_user_available() {
+    if should_drop_privs; then
+        command -v su >/dev/null 2>&1 || {
+            [ "${XBUILD_ALLOW_ROOT_RECIPES:-0}" = "1" ] && { warn "su not available; proceeding as root due to XBUILD_ALLOW_ROOT_RECIPES=1"; return 0; }
+            die "running as root with XBUILD_UNPRIVILEGED_BUILD=1 requires 'su' (or set XBUILD_ALLOW_ROOT_RECIPES=1)"
+        }
+        id "$XBUILD_BUILD_USER" >/dev/null 2>&1 || {
+            [ "${XBUILD_ALLOW_ROOT_RECIPES:-0}" = "1" ] && { warn "build user '$XBUILD_BUILD_USER' not found; proceeding as root due to XBUILD_ALLOW_ROOT_RECIPES=1"; return 0; }
+            die "build user '$XBUILD_BUILD_USER' not found (set XBUILD_BUILD_USER or XBUILD_ALLOW_ROOT_RECIPES=1)"
+        }
+    fi
+}
+
+run_build_logged() {
+    # run_build_logged <dir> <shell-snippet>
+    dir=$1; shift
+    snippet=$*
+    if should_drop_privs; then
+        # run through su while capturing logs
+        run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd "$(printf '%s' "$dir" | sed 's/"/\\"/g')" && $snippet"
+        return $?
+    fi
+    (cd "$dir" && run_strict sh -c "$snippet")
+}
+
+
 # -------- Download --------
 downloader_detect() {
     if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
@@ -273,6 +309,9 @@ recipe_load() {
     PKG_CUSTOM_BUILD= PKG_CUSTOM_INSTALL=
     # shellcheck disable=SC1090
     if [ "$XBUILD_STRICT" = "1" ]; then
+        if [ -L "$XBUILD_RECIPES" ]; then
+            die "refusing symlink recipes directory: $XBUILD_RECIPES"
+        fi
         # Running as root: refuse recipes/dirs writable by group/others (basic supply-chain hardening).
         if [ -L "$recipe_file" ]; then
             die "refusing to load symlink recipe: $recipe_file"
@@ -369,20 +408,21 @@ export_env() {
 
 do_build() {
     export_env
+    assert_build_user_available
     if [ -n "${PKG_PRE_BUILD:-}" ]; then
-        (cd "$SRCDIR" && sh -c "$PKG_PRE_BUILD") || die "PKG_PRE_BUILD failed"
+        run_build_logged "$SRCDIR" "$PKG_PRE_BUILD" || die "PKG_PRE_BUILD failed"
     fi
     case "$PKG_BUILD_SYSTEM" in
         autotools)
             [ -x "$SRCDIR/configure" ] || die "configure not found (set PKG_BUILD_SYSTEM or PKG_DIRNAME): $SRCDIR"
-            (cd "$SRCDIR" && run_strict ./configure --prefix="$XBUILD_PREFIX" $PKG_CONFIGURE_OPTS) || die "configure failed"
-            (cd "$SRCDIR" && run_strict make $PKG_MAKE_OPTS) || die "make failed"
+            run_build_logged "$SRCDIR" "./configure --prefix=\"$XBUILD_PREFIX\" $PKG_CONFIGURE_OPTS" || die "configure failed"
+            run_build_logged "$SRCDIR" "make $PKG_MAKE_OPTS" || die "make failed"
             ;;
         cmake)
             need_cmd cmake
             mkp "$SRCDIR/.xbuild-cmake"
-            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake -DCMAKE_INSTALL_PREFIX="$XBUILD_PREFIX" $PKG_CONFIGURE_OPTS ..) || die "cmake configure failed"
-            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --build . -- -j"$XBUILD_JOBS" $PKG_MAKE_OPTS) || die "cmake build failed"
+            run_build_logged "$SRCDIR/.xbuild-cmake" "cmake -DCMAKE_INSTALL_PREFIX=\"$XBUILD_PREFIX\" $PKG_CONFIGURE_OPTS .." || die "cmake configure failed"
+            run_build_logged "$SRCDIR/.xbuild-cmake" "cmake --build . -- -j\"$XBUILD_JOBS\" $PKG_MAKE_OPTS" || die "cmake build failed"
             ;;
         meson)
             need_cmd meson; need_cmd ninja
@@ -391,46 +431,47 @@ do_build() {
             (cd "$SRCDIR/.xbuild-meson" && run_strict ninja) || die "ninja build failed"
             ;;
         make)
-            (cd "$SRCDIR" && run_strict make $PKG_MAKE_OPTS) || die "make failed"
+            run_build_logged "$SRCDIR" "make $PKG_MAKE_OPTS" || die "make failed"
             ;;
         custom)
             [ -n "${PKG_CUSTOM_BUILD:-}" ] || die "PKG_BUILD_SYSTEM=custom requires PKG_CUSTOM_BUILD"
-            (cd "$SRCDIR" && sh -c "$PKG_CUSTOM_BUILD") || die "custom build failed"
+            run_build_logged "$SRCDIR" "$PKG_CUSTOM_BUILD" || die "custom build failed"
             ;;
         *)
             die "unknown PKG_BUILD_SYSTEM: $PKG_BUILD_SYSTEM"
             ;;
     esac
     if [ -n "${PKG_POST_BUILD:-}" ]; then
-        (cd "$SRCDIR" && sh -c "$PKG_POST_BUILD") || die "PKG_POST_BUILD failed"
+        run_build_logged "$SRCDIR" "$PKG_POST_BUILD" || die "PKG_POST_BUILD failed"
     fi
 }
 
 do_stage_install() {
     export_env
+    assert_build_user_available
     safe_rm_rf "$DESTDIR" 2>/dev/null || :
     mkp "$DESTDIR"
     if [ -n "${PKG_PRE_INSTALL:-}" ]; then
-        (cd "$SRCDIR" && sh -c "$PKG_PRE_INSTALL") || die "PKG_PRE_INSTALL failed"
+        run_build_logged "$SRCDIR" "$PKG_PRE_INSTALL" || die "PKG_PRE_INSTALL failed"
     fi
     case "$PKG_BUILD_SYSTEM" in
         autotools|make)
-            (cd "$SRCDIR" && run_strict make DESTDIR="$DESTDIR" install $PKG_INSTALL_OPTS) || die "install failed"
+            run_build_logged "$SRCDIR" "make DESTDIR=\"$DESTDIR\" install $PKG_INSTALL_OPTS" || die "install failed"
             ;;
         cmake)
             # CMake honors DESTDIR env; avoid unsupported flags for portability.
-            (cd "$SRCDIR/.xbuild-cmake" && DESTDIR="$DESTDIR" run_strict cmake --install . --prefix "$XBUILD_PREFIX" $PKG_INSTALL_OPTS) || die "cmake install failed"
+            run_build_logged "$SRCDIR/.xbuild-cmake" "DESTDIR=\"$DESTDIR\" cmake --install . --prefix \"$XBUILD_PREFIX\" $PKG_INSTALL_OPTS" || die "cmake install failed"
             ;;
         meson)
-            (cd "$SRCDIR/.xbuild-meson" && DESTDIR="$DESTDIR" run_strict ninja install) || die "meson install failed"
+            run_build_logged "$SRCDIR/.xbuild-meson" "DESTDIR=\"$DESTDIR\" ninja install" || die "meson install failed"
             ;;
         custom)
             [ -n "${PKG_CUSTOM_INSTALL:-}" ] || die "PKG_BUILD_SYSTEM=custom requires PKG_CUSTOM_INSTALL"
-            (cd "$SRCDIR" && sh -c "$PKG_CUSTOM_INSTALL") || die "custom install failed"
+            run_build_logged "$SRCDIR" "$PKG_CUSTOM_INSTALL" || die "custom install failed"
             ;;
     esac
     if [ -n "${PKG_POST_INSTALL:-}" ]; then
-        (cd "$SRCDIR" && sh -c "$PKG_POST_INSTALL") || die "PKG_POST_INSTALL failed"
+        run_build_logged "$SRCDIR" "$PKG_POST_INSTALL" || die "PKG_POST_INSTALL failed"
     fi
 }
 
@@ -455,6 +496,13 @@ manifest_write() {
         echo "url=$PKG_URL"
         echo "sha256=$PKG_SHA256"
         echo "built_at=$(now_utc)"
+        echo "strict=$XBUILD_STRICT"
+        echo "unprivileged_build=$XBUILD_UNPRIVILEGED_BUILD"
+        echo "build_user=$XBUILD_BUILD_USER"
+        echo "allow_root_recipes=$XBUILD_ALLOW_ROOT_RECIPES"
+        echo "host=$(uname -a 2>/dev/null || echo unknown)"
+        echo "recipe_file=$recipe_file"
+        echo "recipe_sha256=$(sha256sum "$recipe_file" 2>/dev/null | awk '{print $1}' )"
     } >"$META"
 }
 
@@ -483,12 +531,102 @@ collision_check() {
 tar_extract_try() {
     # tar_extract_try <rootdir>
     root=$1
-    # Try preserving perms first, fallback without -p if tar doesn't support it.
-    if (cd "$root" && tar -xpf -) 2>/dev/null; then
+    # Hardened extraction: avoid directory symlink traversal when possible.
+    if tar --help 2>/dev/null | grep -q -- '--keep-directory-symlink'; then
+        if (cd "$root" && tar -xpf - --keep-directory-symlink) 2>/dev/null; then
+            return 0
+        fi
+        warn "tar extract failed with --keep-directory-symlink; retrying without -p"
+        (cd "$root" && tar -xf - --keep-directory-symlink) || return 1
         return 0
     fi
-    warn "tar does not support -p or failed; retrying without permission preservation"
-    (cd "$root" && tar -xf -) || return 1
+    warn "tar lacks --keep-directory-symlink; refusing unsafe extraction"
+    return 1
+}
+
+
+
+validate_relpath() {
+    p=$1
+    [ -n "$p" ] || die "empty path in manifest"
+    case "$p" in
+        /*) die "manifest contains absolute path: $p" ;;
+    esac
+    case "$p" in
+        *"../"*|*".." ) die "manifest contains traversal path: $p" ;;
+    esac
+    case "$p" in
+        *$'\n'* ) die "manifest contains newline in path (unsupported): $p" ;;
+    esac
+}
+
+assert_no_symlink_components() {
+    # assert_no_symlink_components <root> <relpath>
+    root=$1; rel=$2
+    base=$root
+    parent=${rel%/*}
+    if [ "$parent" = "$rel" ]; then
+        # no slash => parent is root
+        return 0
+    fi
+    IFS=/
+    set -- $parent
+    unset IFS
+    for comp in "$@"; do
+        [ -n "$comp" ] || continue
+        next="$base/$comp"
+        # Refuse if any existing component is a symlink (prevents traversal via directory symlinks).
+        [ -L "$next" ] && die "unsafe symlink path component in rootfs: $next (from $rel)"
+        base=$next
+    done
+}
+
+validate_destdir_safety() {
+    # Reject dangerous symlinks in DESTDIR (absolute or traversal)
+    [ -d "$DESTDIR" ] || die "missing DESTDIR: $DESTDIR"
+    find "$DESTDIR" -type l -print 2>/dev/null | while IFS= read -r lnk; do
+        tgt=$(readlink "$lnk" 2>/dev/null || echo "")
+        [ -n "$tgt" ] || continue
+        case "$tgt" in
+            /*) die "unsafe absolute symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
+        esac
+        case "$tgt" in
+            *"../"*|*".." ) die "unsafe traversal symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
+        esac
+    done
+}
+
+copy_to_rootfs_by_manifest() {
+    # Requires: MANIFEST, DESTDIR, XBUILD_ROOTFS
+    [ -f "$MANIFEST" ] || die "missing manifest: $MANIFEST"
+    validate_destdir_safety
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        validate_relpath "$rel"
+        src="$DESTDIR/$rel"
+        dst="$XBUILD_ROOTFS/$rel"
+
+        [ -e "$src" ] || [ -L "$src" ] || die "manifest entry missing in DESTDIR: $rel"
+
+        assert_no_symlink_components "$XBUILD_ROOTFS" "$rel"
+
+        # Ensure parent directory exists (creating intermediate dirs in ROOTFS only)
+        dstdir=$(dirname "$dst")
+        mkp "$dstdir"
+
+        # Refuse to overwrite directories with files/symlinks unless force
+        if [ -d "$dst" ] && [ ! -d "$src" ]; then
+            [ "$XBUILD_FORCE" = "1" ] || die "refusing to overwrite existing directory in rootfs: $dst"
+            safe_rm_rf "$dst"
+        else
+            rm -f "$dst" 2>/dev/null || :
+        fi
+
+        # Use cp -a to preserve perms, timestamps, and symlinks.
+        # Note: cp -a is widely available in coreutils/busybox; if unavailable, fail explicitly.
+        command -v cp >/dev/null 2>&1 || die "missing command: cp"
+        cp -a "$src" "$dst" || die "failed to install: $rel"
+    done <"$MANIFEST"
 }
 
 copy_to_rootfs() {
@@ -504,8 +642,8 @@ copy_to_rootfs() {
     # Verify collisions before writing into rootfs.
     collision_check
 
-    # Copy using tar pipeline to preserve permissions and symlinks when possible.
-    (cd "$DESTDIR" && tar -cf - .) | tar_extract_try "$XBUILD_ROOTFS" || die "copy into rootfs failed"
+    # Copy using manifest with path-component validation (prevents symlink traversal).
+    copy_to_rootfs_by_manifest
 }
 
 register_and_finalize() {
@@ -674,6 +812,8 @@ parse_args() {
         shift
     done
 
+    [ "$VERBOSE" -eq 1 ] && set -x
+
     if [ "$CMD" = "list" ]; then
         return 0
     fi
@@ -687,6 +827,9 @@ main() {
 
     # strict sanity checks that don't require recipe
     if [ "$XBUILD_STRICT" = "1" ]; then
+        if [ -L "$XBUILD_RECIPES" ]; then
+            die "refusing symlink recipes directory: $XBUILD_RECIPES"
+        fi
         is_abs "$XBUILD_PREFIX" || die "prefix must be absolute (e.g. /usr): $XBUILD_PREFIX"
         is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
     fi
