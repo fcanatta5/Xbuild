@@ -1,6 +1,12 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.6"
+# XBUILD_VERSION="0.0.7"
 # License: MIT-0 (do whatever you want, no warranty).
+
+# -------- Shell hardening --------
+set -eu
+# Safer word-splitting
+IFS=\' 	
+\'
 
 # -------- Defaults (override via environment) --------
 : "${XBUILD_PREFIX:=/usr}"
@@ -17,6 +23,7 @@
 : "${XBUILD_UMASK:=022}"
 : "${XBUILD_KEEP_BUILD:=0}"            # 1 keeps build dir after success
 : "${XBUILD_VERIFY_TLS:=1}"            # 0 passes -k to curl (not recommended)
+: "${XBUILD_ALLOW_INSECURE_HTTP:=0}"   # 1 allows http:// downloads (insecure)
 : "${XBUILD_ASSUME_YES:=0}"            # 1 skips prompts for destructive actions
 : "${XBUILD_STRICT:=1}"                # 1 enables stricter checks
 : "${XBUILD_FORCE:=0}"                 # 1 allows file collisions with installed packages
@@ -237,16 +244,14 @@ should_drop_privs() {
 
 assert_build_user_available() {
     if should_drop_privs; then
-        command -v su >/dev/null 2>&1 || {
-            [ "${XBUILD_ALLOW_ROOT_RECIPES:-0}" = "1" ] && { warn "su not available; proceeding as root due to XBUILD_ALLOW_ROOT_RECIPES=1"; return 0; }
-            die "running as root with XBUILD_UNPRIVILEGED_BUILD=1 requires 'su' (or set XBUILD_ALLOW_ROOT_RECIPES=1)"
-        }
-        id "$XBUILD_BUILD_USER" >/dev/null 2>&1 || {
-            [ "${XBUILD_ALLOW_ROOT_RECIPES:-0}" = "1" ] && { warn "build user '$XBUILD_BUILD_USER' not found; proceeding as root due to XBUILD_ALLOW_ROOT_RECIPES=1"; return 0; }
-            die "build user '$XBUILD_BUILD_USER' not found (set XBUILD_BUILD_USER or XBUILD_ALLOW_ROOT_RECIPES=1)"
-        }
+        # For security, xbuild refuses to run recipe/build code as root when unprivileged mode is requested.
+        # XBUILD_ALLOW_ROOT_RECIPES is deprecated and ignored.
+        [ "${XBUILD_ALLOW_ROOT_RECIPES:-0}" = "1" ] && warn "XBUILD_ALLOW_ROOT_RECIPES=1 is ignored for safety; refusing to proceed as root"
+        command -v su >/dev/null 2>&1 || die "running as root with XBUILD_UNPRIVILEGED_BUILD=1 requires 'su'"
+        id "$XBUILD_BUILD_USER" >/dev/null 2>&1 || die "build user '$XBUILD_BUILD_USER' not found (set XBUILD_BUILD_USER)"
     fi
 }
+
 
 run_build_logged() {
     # run_build_logged <dir> <shell-snippet>
@@ -343,6 +348,13 @@ sha256_check() {
 
            recipe_load() {
     recipe_file=$1
+
+    # Require recipe to live under XBUILD_RECIPES (defense-in-depth).
+    case "$recipe_file" in
+        "$XBUILD_RECIPES"/*) : ;;
+        *) die "refusing to load recipe outside recipes dir: $recipe_file" ;;
+    esac
+    [ -f "$recipe_file" ] || die "recipe file not found: $recipe_file"
     PKG_NAME= PKG_VERSION= PKG_URL= PKG_SHA256=
     PKG_ARCHIVE= PKG_DIRNAME= PKG_SITE= PKG_LICENSE=
     PKG_DEPENDS= PKG_BUILD_SYSTEM= PKG_CONFIGURE_OPTS=
@@ -398,8 +410,14 @@ paths_init() {
     mkp "$XBUILD_STAGING"
     mkp "$XBUILD_DB"
     mkp "$XBUILD_LOGS"
-    XBUILD_TMPDIR="$XBUILD_WORK/tmp.$$"
-    mkp "$XBUILD_TMPDIR"
+        # Create an unpredictable, private temp directory
+    if command -v mktemp >/dev/null 2>&1; then
+        XBUILD_TMPDIR=$(mktemp -d "$XBUILD_WORK/tmp.xbuild.XXXXXX") || die "cannot create temp dir"
+    else
+        XBUILD_TMPDIR="$XBUILD_WORK/tmp.xbuild.$$.$(date '+%s' 2>/dev/null || echo $$)"
+        mkp "$XBUILD_TMPDIR"
+    fi
+    chmod 700 "$XBUILD_TMPDIR" 2>/dev/null || :
     SRCFILE="$XBUILD_SOURCES/$PKG_ARCHIVE"
     BUILDD="$XBUILD_BUILDDIR/$PKG_ID"
     STAGED="$XBUILD_STAGING/$PKG_ID"
