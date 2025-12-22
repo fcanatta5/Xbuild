@@ -7,9 +7,11 @@ set -eu
 # - sh, awk, sed, grep, find, mkdir, rm, rmdir, chmod, cp OR tar
 # - tar and/or unzip depending on archive format
 # - cksum (POSIX)
+# - curl or wget for fetching (recommended)
+# - sha256sum OR shasum OR openssl for SHA-256 verification
 ###############################################################################
 
-XBUILD_VERSION="0.0.0"
+XBUILD_VERSION="0.0.1-fetch"
 
 ###############################################################################
 # Configuration 
@@ -20,6 +22,8 @@ XBUILD_VERSION="0.0.0"
 : "${XBUILD_SYSROOT:=$XBUILD_ROOT/sysroot}"
 : "${XBUILD_DB:=$XBUILD_ROOT/db}"
 : "${XBUILD_LOCKDIR:=$XBUILD_ROOT/.xbuild.lock}"
+
+: "${XBUILD_DISTFILES:=$XBUILD_ROOT/distfiles}"
 
 : "${XBUILD_INSTALL_MODE:=host}"    # host | sysroot
 : "${XBUILD_TARGET_ROOT:=/}"        # used in host mode; must be "/" unless you know what you're doing
@@ -57,7 +61,7 @@ reject_newlines_in_tree() {
 }
 
 ###############################################################################
-# Config loading 
+# Config loading (explicit)
 ###############################################################################
 
 load_config() {
@@ -105,6 +109,163 @@ target_root() {
             die "invalid XBUILD_INSTALL_MODE: $XBUILD_INSTALL_MODE (expected host|sysroot)"
             ;;
     esac
+}
+
+###############################################################################
+# Distfiles fetch + cache + sha256
+###############################################################################
+
+is_url() {
+    case "$1" in
+        http://*|https://*|ftp://*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+url_basename() {
+    # Strip query string if present.
+    u=$1
+    b=${u##*/}
+    b=${b%%\?*}
+    [ -n "$b" ] || die "cannot derive distfile name from URL: $u"
+    printf '%s\n' "$b"
+}
+
+sha256_tool() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s\n' "sha256sum"
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        # perl shasum typically supports -a 256
+        printf '%s\n' "shasum"
+        return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        printf '%s\n' "openssl"
+        return 0
+    fi
+    return 1
+}
+
+sha256_file() {
+    f=$1
+    tool=$(sha256_tool) || die "no sha256 tool found (need sha256sum, shasum, or openssl)"
+    case "$tool" in
+        sha256sum) sha256sum "$f" | awk '{print $1}' ;;
+        shasum) shasum -a 256 "$f" | awk '{print $1}' ;;
+        openssl) openssl dgst -sha256 "$f" | awk '{print $2}' ;;
+        *) die "unexpected sha256 tool: $tool" ;;
+    esac
+}
+
+verify_sha256() {
+    f=$1 want=$2
+    [ -n "$want" ] || die "missing SOURCE_SHA256 for $f"
+    got=$(sha256_file "$f")
+    [ "$got" = "$want" ] || die "sha256 mismatch for $(basename "$f"): expected $want, got $got"
+}
+
+fetch_url_to() {
+    url=$1 out=$2
+    tmp="$out.part.$$"
+    rm -f "$tmp"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail --retry 3 --retry-delay 1 -o "$tmp" "$url" || {
+            rm -f "$tmp"
+            die "fetch failed (curl): $url"
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp" "$url" || {
+            rm -f "$tmp"
+            die "fetch failed (wget): $url"
+        }
+    else
+        die "no fetch tool found (need curl or wget)"
+    fi
+
+    mv "$tmp" "$out"
+}
+
+fetch_distfile() {
+    # Inputs: SOURCE (local path) OR SOURCE_URL (remote), and optional SOURCE_FILE name.
+    # Outputs: echoes the resolved local distfile path.
+    : "${PKGNAME:?recipe missing PKGNAME}"
+    : "${VERSION:?recipe missing VERSION}"
+
+    mkdirp "$XBUILD_DISTFILES"
+
+    # Determine URL/path
+    if [ -n "${SOURCE_URL:-}" ]; then
+        url=$SOURCE_URL
+    elif [ -n "${SOURCE:-}" ] && is_url "$SOURCE"; then
+        url=$SOURCE
+    else
+        url=""
+    fi
+
+    if [ -n "$url" ]; then
+        fname=${SOURCE_FILE:-$(url_basename "$url")}
+        dest="$XBUILD_DISTFILES/$fname"
+
+        if [ -f "$dest" ]; then
+            # Verify cached file before use.
+            if [ -n "${SOURCE_SHA256:-}" ]; then
+                verify_sha256 "$dest" "$SOURCE_SHA256"
+            fi
+            printf '%s\n' "$dest"
+            return 0
+        fi
+
+        msg "fetching distfile: $url"
+        fetch_url_to "$url" "$dest"
+
+        if [ -n "${SOURCE_SHA256:-}" ]; then
+            verify_sha256 "$dest" "$SOURCE_SHA256"
+        else
+            die "SOURCE_SHA256 is required for remote sources (PKGNAME=$PKGNAME)"
+        fi
+
+        printf '%s\n' "$dest"
+        return 0
+    fi
+
+    # Local source path case
+    : "${SOURCE:?recipe missing SOURCE or SOURCE_URL}"
+    [ -f "$SOURCE" ] || die "SOURCE not found: $SOURCE"
+    if [ -n "${SOURCE_SHA256:-}" ]; then
+        verify_sha256 "$SOURCE" "$SOURCE_SHA256"
+    fi
+    printf '%s\n' "$SOURCE"
+}
+
+cmd_fetch_recipe() {
+    recipe=$1
+    [ -f "$recipe" ] || die "recipe not found: $recipe"
+    # shellcheck disable=SC1090
+    . "$recipe"
+
+    : "${PKGNAME:?recipe missing PKGNAME}"
+    : "${VERSION:?recipe missing VERSION}"
+
+    # Resolve/fetch distfile and verify checksum.
+    dist=$(fetch_distfile)
+    msg "distfile ready: $dist"
+}
+
+cmd_distfiles_ls() {
+    mkdirp "$XBUILD_DISTFILES"
+    ls -l "$XBUILD_DISTFILES"
+}
+
+cmd_distfiles_prune_partials() {
+    mkdirp "$XBUILD_DISTFILES"
+    # Remove orphaned partial downloads (*.part.*)
+    find "$XBUILD_DISTFILES" -maxdepth 1 -type f -name '*.part.*' -print | while IFS= read -r f; do
+        rm -f "$f" 2>/dev/null || true
+    done
+    msg "pruned partial downloads in: $XBUILD_DISTFILES"
 }
 
 ###############################################################################
@@ -424,8 +585,11 @@ build_pkg() {
     rm -rf "$work"
     mkdirp "$srcdir" "$builddir" "$staged"
 
+    msg "preparing distfile: $PKGNAME-$VERSION"
+    distfile=$(fetch_distfile)
+
     msg "extracting: $PKGNAME-$VERSION"
-    extract "$SOURCE" "$srcdir"
+    extract "$distfile" "$srcdir"
 
     # Determine the effective source directory.
     sourcedir="$srcdir"
@@ -480,8 +644,12 @@ usage() {
     cat >&2 <<EOF
 xbuild $XBUILD_VERSION
 Usage:
-  xbuild build <recipe>
+  xbuild fetch <recipe>          # download + verify distfile (no build)
+  xbuild build <recipe>          # fetch (if needed), verify, build, install
   xbuild remove <pkg>
+
+  xbuild distfiles ls            # list cached distfiles
+  xbuild distfiles prune         # remove partial downloads
 
 Modes:
   XBUILD_INSTALL_MODE=host|sysroot (default: host)
@@ -498,14 +666,23 @@ EOF
 }
 
 main() {
-    need awk; need sed; need grep; need find; need mkdir; need rm; need rmdir; need chmod; need cksum
+    need awk; need sed; need grep; need find; need mkdir; need rm; need rmdir; need chmod; need cksum; need head
     load_config
     lock
 
     cmd=${1:-}
     case "$cmd" in
+        fetch)  [ $# -eq 2 ] || usage; cmd_fetch_recipe "$2" ;;
         build)  [ $# -eq 2 ] || usage; build_pkg "$2" ;;
         remove) [ $# -eq 2 ] || usage; remove_pkg "$2" ;;
+        distfiles)
+            sub=${2:-}
+            case "$sub" in
+                ls)    [ $# -eq 2 ] || usage; cmd_distfiles_ls ;;
+                prune) [ $# -eq 2 ] || usage; cmd_distfiles_prune_partials ;;
+                *) die "unknown distfiles subcommand: ${sub:-} (expected ls|prune)" ;;
+            esac
+            ;;
         ""|-h|--help|help) usage ;;
         *) die "unknown command: $cmd" ;;
     esac
