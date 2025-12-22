@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.4"
+# XBUILD_VERSION="0.0.5"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Defaults (override via environment) --------
@@ -240,19 +240,37 @@ assert_build_user_available() {
     fi
 }
 
-run_build_logged() {
-    # run_build_logged <dir> <shell-snippet>
-    dir=$1; shift
-    snippet=$*
-    if should_drop_privs; then
-        # run through su while capturing logs
-        escdir=$(printf '%s' "$dir" | sed 's/"/\\"/g')
-        # Quote directory for whitespace/special chars safety
-        run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd \"$escdir\" && $snippet"
-        return $?
-    fi
-    (cd "$dir" && run_strict sh -c "$snippet")
-}
+           run_build_logged() {
+               # run_build_logged <dir> <shell-snippet>
+               dir=$1; shift
+               # Expect a single snippet argument from callers; preserve exact string.
+               snippet=$1
+
+               script="$XBUILD_TMPDIR/snippet.$$.$RANDOM.sh"
+               : >"$script" || die "cannot write temp script"
+               chmod 700 "$script" 2>/dev/null || :
+               {
+                   printf '%s
+' '#!/bin/sh'
+                   printf '%s
+' "$snippet"
+               } >"$script" || die "cannot write temp script"
+               chmod 700 "$script" 2>/dev/null || :
+
+               if should_drop_privs; then
+                   escdir=$(printf '%s' "$dir" | sed 's/"/\"/g')
+                   escscript=$(printf '%s' "$script" | sed 's/"/\"/g')
+                   run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd "$escdir" && sh "$escscript""
+                   rc=$?
+               else
+                   (cd "$dir" && run_strict sh "$script")
+                   rc=$?
+               fi
+
+               rm -f -- "$script" 2>/dev/null || rm -f "$script" 2>/dev/null || :
+               return $rc
+           }
+
 
 
 # -------- Download --------
@@ -272,7 +290,7 @@ download_file() {
             run_strict curl $tlsflag -L --fail --retry 3 --retry-delay 2 -o "$out" "$url"
             ;;
         wget)
-            run_strict wget -O "$out" "$url"
+            run_strict wget -O "$out" -t 3 -T 30 "$url"
             ;;
     esac
 }
@@ -285,23 +303,31 @@ sha256_check() {
 }
 
 # -------- Recipe loading --------
-recipe_find() {
-    arg=$1
-    case "$arg" in
-        */*) cat=${arg%/*}; name=${arg##*/};;
-        *) cat=""; name="$arg";;
-    esac
-    if [ -n "$cat" ]; then
-        f="$XBUILD_RECIPES/$cat/$name.sh"
-        [ -f "$f" ] && { echo "$f"; return 0; }
-        die "recipe not found: $arg (expected $f)"
-    fi
-    f=$(ls -1 "$XBUILD_RECIPES"/*/"$name".sh 2>/dev/null | awk 'NR==1{print;exit}')
-    [ -n "$f" ] && [ -f "$f" ] && { echo "$f"; return 0; }
-    die "recipe not found by name: $name"
-}
+           recipe_find() {
+               arg=$1
+               case "$arg" in
+                   */*) cat=${arg%/*}; name=${arg##*/} ;;
+                   *) cat=""; name="$arg" ;;
+               esac
 
-recipe_load() {
+               if [ -n "$cat" ]; then
+                   f="$XBUILD_RECIPES/$cat/$name.sh"
+                   [ -f "$f" ] && { echo "$f"; return 0; }
+                   die "recipe not found: $arg (expected $f)"
+               fi
+
+               # Search all categories; abort on ambiguity for deterministic behavior.
+               matches=$(find "$XBUILD_RECIPES" -mindepth 2 -maxdepth 2 -type f -name "$name.sh" -print 2>/dev/null | LC_ALL=C sort)
+               [ -n "$matches" ] || die "recipe not found by name: $name"
+
+               count=$(printf '%s
+' "$matches" | awk 'NF{c++} END{print c+0}')
+               [ "$count" -eq 1 ] || die "ambiguous recipe name: $name (use category/name)"
+               printf '%s
+' "$matches" | awk 'NF{print; exit}'
+           }
+
+           recipe_load() {
     recipe_file=$1
     PKG_NAME= PKG_VERSION= PKG_URL= PKG_SHA256=
     PKG_ARCHIVE= PKG_DIRNAME= PKG_SITE= PKG_LICENSE=
@@ -364,21 +390,41 @@ paths_init() {
     BUILDD="$XBUILD_BUILDDIR/$PKG_ID"
     STAGED="$XBUILD_STAGING/$PKG_ID"
     PKG_DB="$XBUILD_DB/$PKG_ID"
-    mkp "$PKG_DB"
     logfile="$XBUILD_LOGS/$PKG_ID.$CMD.$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S').log"
     : >"$logfile" || die "cannot write log: $logfile"
 }
 
 # -------- Unpack / patch --------
+tar_validate_entries() {
+    # Reject absolute paths and traversal via .. entries
+    tar -tf "$1" 2>/dev/null | awk '
+        BEGIN{bad=0}
+        $0 ~ /^\// {bad=1}
+        $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1}
+        END{exit bad}
+    ' || die "archive contains unsafe paths (absolute or ..): $1"
+}
+
+zip_validate_entries() {
+    # Best-effort validation; relies on unzip -l output having name as last field.
+    unzip -l "$1" 2>/dev/null | awk '
+        {name=$NF}
+        name ~ /^\// {bad=1}
+        name ~ /(^|\/)\.\.(\/|$)/ {bad=1}
+        END{exit bad}
+    ' || die "zip contains unsafe paths (absolute or ..): $1"
+}
+
 unpack_source() {
     safe_rm_rf "$BUILDD" 2>/dev/null || :
     mkp "$BUILDD"
+    need_cmd tar
     case "$SRCFILE" in
-        *.tar.gz|*.tgz)   run_strict tar -xzf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.xz)         run_strict tar -xJf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.bz2|*.tbz2) run_strict tar -xjf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.zst)        need_cmd zstd; run_strict tar --use-compress-program=zstd -xf "$SRCFILE" -C "$BUILDD" ;;
-        *.zip)            need_cmd unzip; run_strict unzip -q "$SRCFILE" -d "$BUILDD" ;;
+        *.tar.gz|*.tgz)   tar_validate_entries "$SRCFILE"; run_strict tar -xzf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.xz)         tar_validate_entries "$SRCFILE"; run_strict tar -xJf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.bz2|*.tbz2) tar_validate_entries "$SRCFILE"; run_strict tar -xjf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.zst)        need_cmd zstd; tar_validate_entries "$SRCFILE"; run_strict tar --use-compress-program=zstd -xf "$SRCFILE" -C "$BUILDD" ;;
+        *.zip)            need_cmd unzip; zip_validate_entries "$SRCFILE"; run_strict unzip -q "$SRCFILE" -d "$BUILDD" ;;
         *) die "unknown archive format: $SRCFILE" ;;
     esac
     SRCDIR="$BUILDD/$PKG_DIRNAME"
@@ -531,23 +577,6 @@ collision_check() {
     done
 }
 
-tar_extract_try() {
-    # tar_extract_try <rootdir>
-    root=$1
-    # Hardened extraction: avoid directory symlink traversal when possible.
-    if tar --help 2>/dev/null | grep -q -- '--keep-directory-symlink'; then
-        if (cd "$root" && tar -xpf - --keep-directory-symlink) 2>/dev/null; then
-            return 0
-        fi
-        warn "tar extract failed with --keep-directory-symlink; retrying without -p"
-        (cd "$root" && tar -xf - --keep-directory-symlink) || return 1
-        return 0
-    fi
-    warn "tar lacks --keep-directory-symlink; refusing unsafe extraction"
-    return 1
-}
-
-
 
 validate_relpath() {
     p=$1
@@ -559,7 +588,8 @@ validate_relpath() {
         ../*|*/../*|*/..|.. ) die "manifest contains traversal path: $p" ;;
     esac
     case "$p" in
-        *$'\n'* ) die "manifest contains newline in path (unsupported): $p" ;;
+        *'
+'*) die "manifest contains newline in path (unsupported): $p" ;;
     esac
 }
 
@@ -698,7 +728,7 @@ do_remove_pkgid() {
         [ -n "$d" ] || continue
         validate_relpath "$d"
         assert_no_symlink_components "$rootfs" "$d"
-        rmdir -- "$rootfs/$d" 2>/dev/null || :
+        rmdir "$rootfs/$d" 2>/dev/null || rmdir -- "$rootfs/$d" 2>/dev/null || :
     done
 
     safe_rm_rf "$db"
