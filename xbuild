@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.3"
+# XBUILD_VERSION="0.0.4"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Defaults (override via environment) --------
@@ -246,7 +246,9 @@ run_build_logged() {
     snippet=$*
     if should_drop_privs; then
         # run through su while capturing logs
-        run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd "$(printf '%s' "$dir" | sed 's/"/\\"/g')" && $snippet"
+        escdir=$(printf '%s' "$dir" | sed 's/"/\\"/g')
+        # Quote directory for whitespace/special chars safety
+        run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd \"$escdir\" && $snippet"
         return $?
     fi
     (cd "$dir" && run_strict sh -c "$snippet")
@@ -312,6 +314,7 @@ recipe_load() {
         if [ -L "$XBUILD_RECIPES" ]; then
             die "refusing symlink recipes directory: $XBUILD_RECIPES"
         fi
+        is_abs "$XBUILD_WORK" || die "work dir must be absolute in strict mode: $XBUILD_WORK"
         # Running as root: refuse recipes/dirs writable by group/others (basic supply-chain hardening).
         if [ -L "$recipe_file" ]; then
             die "refusing to load symlink recipe: $recipe_file"
@@ -553,7 +556,7 @@ validate_relpath() {
         /*) die "manifest contains absolute path: $p" ;;
     esac
     case "$p" in
-        *"../"*|*".." ) die "manifest contains traversal path: $p" ;;
+        ../*|*/../*|*/..|.. ) die "manifest contains traversal path: $p" ;;
     esac
     case "$p" in
         *$'\n'* ) die "manifest contains newline in path (unsupported): $p" ;;
@@ -591,7 +594,7 @@ validate_destdir_safety() {
             /*) die "unsafe absolute symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
         esac
         case "$tgt" in
-            *"../"*|*".." ) die "unsafe traversal symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
+            ../*|*/../*|*/..|.. ) die "unsafe traversal symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
         esac
     done
 }
@@ -667,6 +670,8 @@ do_remove_pkgid() {
     [ -f "$mf" ] || die "missing manifest: $mf"
 
     rootfs="$XBUILD_ROOTFS"
+    is_abs "$rootfs" || die "rootfs must be absolute: $rootfs"
+
     if [ -f "$meta" ]; then
         rec_rootfs=$(awk -F= '$1=="rootfs"{print $2}' "$meta" 2>/dev/null | awk 'NR==1{print;exit}')
         [ -n "$rec_rootfs" ] && [ "$rec_rootfs" != "$rootfs" ] && warn "package recorded rootfs=$rec_rootfs; removing from rootfs=$rootfs"
@@ -677,6 +682,8 @@ do_remove_pkgid() {
     awk '{print length, $0}' "$mf" | sort -rn | cut -d" " -f2- |
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
+        validate_relpath "$rel"
+        assert_no_symlink_components "$rootfs" "$rel"
         f="$rootfs/$rel"
         if [ -e "$f" ] || [ -L "$f" ]; then
             rm -f -- "$f" 2>/dev/null || rm -f "$f" || die "cannot remove: $f"
@@ -689,6 +696,8 @@ do_remove_pkgid() {
     awk '{print length, $0}' | sort -rn | cut -d" " -f2- |
     while IFS= read -r d; do
         [ -n "$d" ] || continue
+        validate_relpath "$d"
+        assert_no_symlink_components "$rootfs" "$d"
         rmdir -- "$rootfs/$d" 2>/dev/null || :
     done
 
