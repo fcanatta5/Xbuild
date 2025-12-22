@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.8"
+# XBUILD_VERSION="0.0.9"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Shell hardening --------
@@ -346,7 +346,7 @@ sha256_check() {
                printf '%s\n' "$matches" | awk 'NF{print; exit}'
            }
 
-           recipe_load() {
+ recipe_load() {
     recipe_file=$1
 
     # Require recipe to live under XBUILD_RECIPES (defense-in-depth).
@@ -355,19 +355,19 @@ sha256_check() {
         *) die "refusing to load recipe outside recipes dir: $recipe_file" ;;
     esac
     [ -f "$recipe_file" ] || die "recipe file not found: $recipe_file"
+
     PKG_NAME= PKG_VERSION= PKG_URL= PKG_SHA256=
     PKG_ARCHIVE= PKG_DIRNAME= PKG_SITE= PKG_LICENSE=
     PKG_DEPENDS= PKG_BUILD_SYSTEM= PKG_CONFIGURE_OPTS=
     PKG_MAKE_OPTS= PKG_INSTALL_OPTS= PKG_PATCHES=
     PKG_ENV= PKG_PRE_BUILD= PKG_POST_BUILD= PKG_PRE_INSTALL= PKG_POST_INSTALL=
     PKG_CUSTOM_BUILD= PKG_CUSTOM_INSTALL=
-    # shellcheck disable=SC1090
+
     if [ "$XBUILD_STRICT" = "1" ]; then
         if [ -L "$XBUILD_RECIPES" ]; then
             die "refusing symlink recipes directory: $XBUILD_RECIPES"
         fi
         is_abs "$XBUILD_WORK" || die "work dir must be absolute in strict mode: $XBUILD_WORK"
-        # Running as root: refuse recipes/dirs writable by group/others (basic supply-chain hardening).
         if [ -L "$recipe_file" ]; then
             die "refusing to load symlink recipe: $recipe_file"
         fi
@@ -380,10 +380,12 @@ sha256_check() {
     fi
 
     . "$recipe_file" || die "failed to source recipe: $recipe_file"
-    [ -n "$PKG_NAME" ] || die "recipe missing PKG_NAME ($recipe_file)"
+
+    [ -n "$PKG_NAME" ]    || die "recipe missing PKG_NAME ($recipe_file)"
     [ -n "$PKG_VERSION" ] || die "recipe missing PKG_VERSION ($recipe_file)"
-    [ -n "$PKG_URL" ] || die "recipe missing PKG_URL ($recipe_file)"
-    [ -n "$PKG_SHA256" ] || die "recipe missing PKG_SHA256 ($recipe_file)"
+    [ -n "$PKG_URL" ]     || die "recipe missing PKG_URL ($recipe_file)"
+    [ -n "$PKG_SHA256" ]  || die "recipe missing PKG_SHA256 ($recipe_file)"
+
     # Basic URL scheme hardening
     case "$PKG_URL" in
         https://*) : ;;
@@ -391,25 +393,29 @@ sha256_check() {
         *) die "unsupported or unsafe URL scheme (use https://): $PKG_URL" ;;
     esac
 
-    # Ensure archive filename cannot escape cache/temp directories
-    case "${PKG_ARCHIVE:-}" in
+    : "${PKG_BUILD_SYSTEM:=autotools}"
+
+    # Default PKG_ARCHIVE from URL if missing
+    if [ -z "${PKG_ARCHIVE:-}" ]; then
+        PKG_ARCHIVE=${PKG_URL##*/}
+        [ -n "$PKG_ARCHIVE" ] || die "cannot derive PKG_ARCHIVE from URL"
+    fi
+
+    # Validate PKG_ARCHIVE after defaulting
+    case "$PKG_ARCHIVE" in
         "" ) die "empty PKG_ARCHIVE" ;;
         *"/"*) die "PKG_ARCHIVE must be a filename (no /): $PKG_ARCHIVE" ;;
         *".."* ) die "PKG_ARCHIVE must not contain .. : $PKG_ARCHIVE" ;;
     esac
 
-    : "${PKG_BUILD_SYSTEM:=autotools}"
-    if [ -z "$PKG_ARCHIVE" ]; then
-        PKG_ARCHIVE=${PKG_URL##*/}
-        [ -n "$PKG_ARCHIVE" ] || die "cannot derive PKG_ARCHIVE from URL"
-    fi
-    if [ -z "$PKG_DIRNAME" ]; then
+    if [ -z "${PKG_DIRNAME:-}" ]; then
         d=$PKG_ARCHIVE
         for suf in .tar.gz .tgz .tar.xz .tar.bz2 .tbz2 .tar.zst .zip; do
             case "$d" in *"$suf") d=${d%"$suf"};; esac
         done
         PKG_DIRNAME=$d
     fi
+
     PKG_ID=$(printf '%s-%s' "$PKG_NAME" "$PKG_VERSION")
     PKG_CAT=$(basename "$(dirname "$recipe_file")" 2>/dev/null || echo "unknown")
     PKG_REF="$PKG_CAT/$PKG_NAME"
@@ -442,43 +448,117 @@ paths_init() {
 
 # -------- Unpack / patch --------
 tar_validate_entries() {
-    # Reject absolute paths and traversal via .. entries
-    tar -tf "$1" 2>/dev/null | awk '
+    file=$1
+    [ -f "$file" ] || die "archive not found: $file"
+
+    tmp="$XBUILD_TMPDIR/tarlist.$$"
+    : >"$tmp" || die "cannot write temp list"
+
+    if ! tar -tf "$file" >"$tmp" 2>/dev/null; then
+        rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+        die "cannot list tar entries: $file"
+    fi
+
+    awk '
         BEGIN{bad=0}
         $0 ~ /^\// {bad=1}
         $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1}
         END{exit bad}
-    ' || die "archive contains unsafe paths (absolute or ..): $1"
+    ' "$tmp" || {
+        rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+        die "archive contains unsafe paths (absolute or ..): $file"
+    }
+
+    rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
 }
 
 zip_validate_entries() {
-    # Best-effort validation; relies on unzip -l output having name as last field.
-    unzip -l "$1" 2>/dev/null | awk '
-        {name=$NF}
-        name ~ /^\// {bad=1}
-        name ~ /(^|\/)\.\.(\/|$)/ {bad=1}
+    file=$1
+    [ -f "$file" ] || die "archive not found: $file"
+    need_cmd unzip
+
+    tmp="$XBUILD_TMPDIR/ziplist.$$"
+    : >"$tmp" || die "cannot write temp list"
+
+    # unzip -Z -1 prints only filenames (more reliable than parsing unzip -l)
+    if ! unzip -Z -1 "$file" >"$tmp" 2>/dev/null; then
+        rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+        die "cannot list zip entries: $file"
+    fi
+
+    awk '
+        BEGIN{bad=0}
+        $0 ~ /^\// {bad=1}
+        $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1}
         END{exit bad}
-    ' || die "zip contains unsafe paths (absolute or ..): $1"
+    ' "$tmp" || {
+        rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+        die "zip contains unsafe paths (absolute or ..): $file"
+    }
+
+    rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
 }
 
 unpack_source() {
     safe_rm_rf "$BUILDD" 2>/dev/null || :
     mkp "$BUILDD"
     need_cmd tar
+
     case "$SRCFILE" in
-        *.tar.gz|*.tgz)   tar_validate_entries "$SRCFILE"; run_strict tar -xzf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.xz)         tar_validate_entries "$SRCFILE"; run_strict tar -xJf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.bz2|*.tbz2) tar_validate_entries "$SRCFILE"; run_strict tar -xjf "$SRCFILE" -C "$BUILDD" ;;
-        *.tar.zst)        need_cmd zstd; tar_validate_entries "$SRCFILE"; run_strict tar --use-compress-program=zstd -xf "$SRCFILE" -C "$BUILDD" ;;
-        *.zip)            need_cmd unzip; zip_validate_entries "$SRCFILE"; run_strict unzip -q "$SRCFILE" -d "$BUILDD" ;;
-        *) die "unknown archive format: $SRCFILE" ;;
+        *.tar.gz|*.tgz)
+            tar_validate_entries "$SRCFILE"
+            run_strict tar -xzf "$SRCFILE" -C "$BUILDD"
+            ;;
+        *.tar.xz)
+            tar_validate_entries "$SRCFILE"
+            run_strict tar -xJf "$SRCFILE" -C "$BUILDD"
+            ;;
+        *.tar.bz2|*.tbz2)
+            tar_validate_entries "$SRCFILE"
+            run_strict tar -xjf "$SRCFILE" -C "$BUILDD"
+            ;;
+        *.tar.zst)
+            need_cmd zstd
+
+            # List with the same decompressor that extraction uses, then validate.
+            tmp="$XBUILD_TMPDIR/tarzstlist.$$"
+            : >"$tmp" || die "cannot write temp list"
+
+            if ! tar --use-compress-program=zstd -tf "$SRCFILE" >"$tmp" 2>/dev/null; then
+                rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+                die "cannot list tar.zst entries: $SRCFILE"
+            fi
+
+            awk '
+                BEGIN{bad=0}
+                $0 ~ /^\// {bad=1}
+                $0 ~ /(^|\/)\.\.(\/|$)/ {bad=1}
+                END{exit bad}
+            ' "$tmp" || {
+                rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+                die "archive contains unsafe paths (absolute or ..): $SRCFILE"
+            }
+
+            rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+
+            run_strict tar --use-compress-program=zstd -xf "$SRCFILE" -C "$BUILDD"
+            ;;
+        *.zip)
+            zip_validate_entries "$SRCFILE"
+            run_strict unzip -q "$SRCFILE" -d "$BUILDD"
+            ;;
+        *)
+            die "unknown archive format: $SRCFILE"
+            ;;
     esac
+
     SRCDIR="$BUILDD/$PKG_DIRNAME"
     [ -d "$SRCDIR" ] || {
         d=$(find "$BUILDD" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk 'NR==1{print;exit}')
         [ -n "$d" ] && SRCDIR="$d"
         [ -d "$SRCDIR" ] || die "source dir not found after unpack (expected $BUILDD/$PKG_DIRNAME)"
     }
+
     if [ -n "${PKG_PATCHES:-}" ]; then
         need_cmd patch
         for p in $PKG_PATCHES; do
@@ -667,16 +747,29 @@ assert_no_symlink_components() {
 validate_destdir_safety() {
     # Reject dangerous symlinks in DESTDIR (absolute or traversal)
     [ -d "$DESTDIR" ] || die "missing DESTDIR: $DESTDIR"
-    find "$DESTDIR" -type l -print 2>/dev/null | while IFS= read -r lnk; do
+
+    tmp="$XBUILD_TMPDIR/destdirlinks.$$"
+    : >"$tmp" || die "cannot write temp list"
+
+    if ! find "$DESTDIR" -type l -print >"$tmp" 2>/dev/null; then
+        rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+        die "find failed while scanning DESTDIR symlinks"
+    fi
+
+    while IFS= read -r lnk; do
+        [ -n "$lnk" ] || continue
         tgt=$(readlink "$lnk" 2>/dev/null || echo "")
         [ -n "$tgt" ] || continue
+
         case "$tgt" in
             /*) die "unsafe absolute symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
         esac
         case "$tgt" in
             ../*|*/../*|*/..|.. ) die "unsafe traversal symlink in DESTDIR: $(printf '%s -> %s' "$lnk" "$tgt")" ;;
         esac
-    done
+    done <"$tmp"
+
+    rm -f -- "$tmp" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
 }
 
 copy_to_rootfs_by_manifest() {
