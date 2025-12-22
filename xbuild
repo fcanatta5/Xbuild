@@ -1,1129 +1,636 @@
 #!/bin/sh
+ 
+# License: MIT-0 (do whatever you want, no warranty).
+# XBUILD_VERSION="0.0.0"
 
-set -eu
+# -------- Defaults (override via environment) --------
+: "${XBUILD_PREFIX:=/usr}"
+: "${XBUILD_ROOTFS:=/}"                 # final root ("/" for live system, or a rootfs dir)
+: "${XBUILD_RECIPES:=/var/xbuild/repo/packages}"
+: "${XBUILD_WORK:=/var/lib/xbuild}"
+: "${XBUILD_CACHE:=$XBUILD_WORK/cache}"
+: "${XBUILD_SOURCES:=$XBUILD_CACHE/sources}"
+: "${XBUILD_BUILDDIR:=$XBUILD_WORK/build}"
+: "${XBUILD_STAGING:=$XBUILD_WORK/staging}"   # per-package DESTDIR
+: "${XBUILD_DB:=$XBUILD_WORK/db}"            # installed manifests + metadata
+: "${XBUILD_LOGS:=$XBUILD_WORK/logs}"
+: "${XBUILD_JOBS:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+: "${XBUILD_UMASK:=022}"
+: "${XBUILD_KEEP_BUILD:=0}"            # 1 keeps build dir after success
+: "${XBUILD_VERIFY_TLS:=1}"            # 0 passes -k to curl (not recommended)
+: "${XBUILD_ASSUME_YES:=0}"            # 1 skips prompts for destructive actions
+: "${XBUILD_STRICT:=1}"                # 1 enables stricter checks
 
-###############################################################################
-# REQUIREMENTS (documented, not enforced perfectly)
-# - sh, awk, sed, grep, find, mkdir, rm, rmdir, chmod, cp OR tar
-# - tar and/or unzip depending on archive format
-# - cksum (POSIX)
-# - curl or wget for fetching (recommended)
-# - sha256sum OR shasum OR openssl for SHA-256 verification
-###############################################################################
+# -------- Helpers --------
+umask "$XBUILD_UMASK" 2>/dev/null || :
 
-XBUILD_VERSION="1.1-stable"
+die() { printf '%s\n' "xbuild: ERROR: $*" >&2; exit 1; }
+warn(){ printf '%s\n' "xbuild: WARN:  $*" >&2; }
+msg() { printf '%s\n' "xbuild: $*"; }
 
-###############################################################################
-# Configuration (override via env or config)
-###############################################################################
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 
-: "${XBUILD_ROOT:=$PWD}"
-: "${XBUILD_WORK:=$XBUILD_ROOT/work}"
-: "${XBUILD_SYSROOT:=$XBUILD_ROOT/sysroot}"
-: "${XBUILD_DB:=$XBUILD_ROOT/db}"
-: "${XBUILD_LOCKDIR:=$XBUILD_ROOT/.xbuild.lock}"
+is_abs() { case "$1" in /*) return 0;; *) return 1;; esac; }
 
-: "${XBUILD_DISTFILES:=$XBUILD_ROOT/distfiles}"
-: "${XBUILD_RECIPES_DIR:=$XBUILD_ROOT/recipes}"
+# portable readlink replacement is messy; avoid it. Use physical paths where possible.
+mkp() { mkdir -p "$1" || die "cannot create directory: $1"; }
 
-: "${XBUILD_PROFILE:=host}"          # host | bootstrap | cross
-# XBUILD_INSTALL_MODE is set by profile unless explicitly provided.
-: "${XBUILD_TARGET_ROOT:=/}"        # used in host mode; must be "/" unless you know what you're doing
-: "${XBUILD_ALLOW_HOST_INSTALL:=0}" # must be 1 to install into "/"
-: "${XBUILD_JOBS:=1}"
+now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date; }
 
-: "${XBUILD_STRIP_SUID:=1}"         # 1 = strip setuid/setgid bits during install
-: "${XBUILD_ALLOW_SYMLINKS:=1}"     # 0 = reject archives containing symlinks (very strict)
-: "${XBUILD_STRICT_SYSROOT:=1}"     # 1 = set sysroot pkg-config vars; does not sandbox compiler
-
-: "${XBUILD_CONFIG:=}"              # optional config file to source (shell)
-
-umask 022
-
-###############################################################################
-# Utilities
-###############################################################################
-
-die() { printf '%s\n' "xbuild: $*" >&2; exit 1; }
-msg() { printf '%s\n' "==> $*" >&2; }
-
-need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-mkdirp() { [ -d "$1" ] || mkdir -p "$1"; }
-
-# Reject filenames containing newline (breaks line-based plumbing safely).
-reject_newlines_in_tree() {
-    root=$1
-    # If any path printed by find contains a newline, the output will be ambiguous.
-    # We detect this by checking for an embedded newline in each entry (find prints one per line).
-    # This will not detect literal newlines perfectly, so we instead reject if a file contains '\n'
-    # in its name by using find -print and comparing count; pragmatic: disallow newlines globally.
-    if find "$root" -name '*'"$(printf '\n')"*' >/dev/null 2>&1; then
-        die "newline in filename detected under: $root (unsupported)"
-    fi
+safe_rm_rf() {
+    p=$1
+    [ -n "$p" ] || die "internal: empty path in rm"
+    [ "$p" != "/" ] || die "refusing to remove /"
+    rm -rf -- "$p" 2>/dev/null || rm -rf "$p" || die "cannot remove: $p"
 }
 
-###############################################################################
-# Config loading (explicit)
-###############################################################################
-
-load_config() {
-    [ -n "$XBUILD_CONFIG" ] || return 0
-    [ -f "$XBUILD_CONFIG" ] || die "config not found: $XBUILD_CONFIG"
-    # Config is shell code; user is responsible for protecting it.
-    # shellcheck disable=SC1090
-    . "$XBUILD_CONFIG"
+confirm() {
+    [ "$XBUILD_ASSUME_YES" = "1" ] && return 0
+    printf '%s' "xbuild: $1 [y/N] " >&2
+    IFS= read -r ans || return 1
+    case "$ans" in y|Y|yes|YES) return 0;; *) return 1;; esac
 }
 
-###############################################################################
-# Profiles (host / bootstrap / cross)
-###############################################################################
-
-apply_profile() {
-    # Profiles set defaults. Explicit env/config overrides are respected if set.
-    # Detect whether variables are explicitly set using the ${VAR+x} idiom.
-    install_mode_set=0
-    strict_set=0
-    sysroot_set=0
-    if [ "${XBUILD_INSTALL_MODE+x}" = "x" ]; then install_mode_set=1; fi
-    if [ "${XBUILD_STRICT_SYSROOT+x}" = "x" ]; then strict_set=1; fi
-    if [ "${XBUILD_SYSROOT+x}" = "x" ]; then sysroot_set=1; fi
-
-    case "$XBUILD_PROFILE" in
-        host)
-            if [ $install_mode_set -eq 0 ]; then XBUILD_INSTALL_MODE=host; fi
-            if [ $strict_set -eq 0 ]; then XBUILD_STRICT_SYSROOT=0; fi
-            ;;
-        bootstrap)
-            if [ $install_mode_set -eq 0 ]; then XBUILD_INSTALL_MODE=sysroot; fi
-            if [ $sysroot_set -eq 0 ]; then XBUILD_SYSROOT="$XBUILD_ROOT/bootstrap-sysroot"; fi
-            if [ $strict_set -eq 0 ]; then XBUILD_STRICT_SYSROOT=1; fi
-            ;;
-        cross)
-            if [ $install_mode_set -eq 0 ]; then XBUILD_INSTALL_MODE=sysroot; fi
-            if [ $strict_set -eq 0 ]; then XBUILD_STRICT_SYSROOT=1; fi
-            ;;
-        *)
-            die "invalid XBUILD_PROFILE: $XBUILD_PROFILE (expected host|bootstrap|cross)"
-            ;;
-    esac
-}
-
-
-
-###############################################################################
-# Locking (robust enough: PID + timestamp + host)
-###############################################################################
-
-lock() {
-    mkdirp "$XBUILD_LOCKDIR"
-    if [ -f "$XBUILD_LOCKDIR/meta" ]; then
-        read -r pid ts host <"$XBUILD_LOCKDIR/meta" || true
-        if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-            die "another xbuild instance is running (pid $pid on ${host:-unknown})"
-        fi
-    fi
-    printf '%s %s %s\n' "$$" "$(date +%s 2>/dev/null || echo 0)" "$(hostname 2>/dev/null || echo unknown)" >"$XBUILD_LOCKDIR/meta"
-}
-
-unlock() { rm -rf "$XBUILD_LOCKDIR"; }
-trap unlock EXIT INT TERM
-
-###############################################################################
-# Target root resolution
-###############################################################################
-
-target_root() {
-    case "$XBUILD_INSTALL_MODE" in
-        host)
-            [ "$XBUILD_TARGET_ROOT" = "/" ] || die "in host mode, XBUILD_TARGET_ROOT must be '/' (got '$XBUILD_TARGET_ROOT')"
-            [ "$XBUILD_ALLOW_HOST_INSTALL" = "1" ] || die "refusing to install into '/'. Set XBUILD_ALLOW_HOST_INSTALL=1 to proceed."
-            printf '%s\n' "/"
-            ;;
-        sysroot)
-            mkdirp "$XBUILD_SYSROOT"
-            printf '%s\n' "$XBUILD_SYSROOT"
-            ;;
-        *)
-            die "invalid XBUILD_INSTALL_MODE: $XBUILD_INSTALL_MODE (expected host|sysroot)"
-            ;;
-    esac
-}
-
-###############################################################################
-# Distfiles fetch + cache + sha256
-###############################################################################
-
-is_url() {
-    case "$1" in
-        http://*|https://*|ftp://*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-url_basename() {
-    # Strip query string if present.
-    u=$1
-    b=${u##*/}
-    b=${b%%\?*}
-    [ -n "$b" ] || die "cannot derive distfile name from URL: $u"
-    printf '%s\n' "$b"
-}
-
-sha256_tool() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        printf '%s\n' "sha256sum"
-        return 0
-    fi
-    if command -v shasum >/dev/null 2>&1; then
-        # perl shasum typically supports -a 256
-        printf '%s\n' "shasum"
-        return 0
-    fi
-    if command -v openssl >/dev/null 2>&1; then
-        printf '%s\n' "openssl"
-        return 0
-    fi
-    return 1
-}
-
-sha256_file() {
-    f=$1
-    tool=$(sha256_tool) || die "no sha256 tool found (need sha256sum, shasum, or openssl)"
-    case "$tool" in
-        sha256sum) sha256sum "$f" | awk '{print $1}' ;;
-        shasum) shasum -a 256 "$f" | awk '{print $1}' ;;
-        openssl) openssl dgst -sha256 "$f" | awk '{print $2}' ;;
-        *) die "unexpected sha256 tool: $tool" ;;
-    esac
-}
-
-cmd_hash_file() {
-    [ $# -eq 1 ] || die "usage: xbuild hash <file>"
-    f=$1
-    [ -f "$f" ] || die "file not found: $f"
-    sha256_file "$f"
-}
-
-cmd_hash_recipe() {
-    [ $# -eq 1 ] || die "usage: xbuild hash-recipe <recipe>"
-    recipe=$1
-    [ -f "$recipe" ] || die "recipe not found: $recipe"
-    # shellcheck disable=SC1090
-    . "$recipe"
-    : "${PKGNAME:?recipe missing PKGNAME}"
-    : "${VERSION:?recipe missing VERSION}"
-    dist=$(fetch_distfile 2>/dev/null || true)
-    if [ -n "${dist:-}" ] && [ -f "$dist" ]; then
-        sha256_file "$dist"
-        return 0
-    fi
-    # If recipe is missing SOURCE_SHA256, fall back to gen-sha behavior.
-    cmd_gen_sha "$recipe" | awk 'NR==1{print; exit}'
-}
-
-
-verify_sha256() {
-    f=$1 want=$2
-    [ -n "$want" ] || die "missing SOURCE_SHA256 for $f"
-    got=$(sha256_file "$f")
-    [ "$got" = "$want" ] || die "sha256 mismatch for $(basename "$f"): expected $want, got $got"
-}
-cmd_gen_sha() {
-    # usage: xbuild gen-sha <recipe|pkg|url>
-    [ $# -eq 1 ] || die "usage: xbuild gen-sha <recipe|pkg|url>"
-    arg=$1
-
-    mkdirp "$XBUILD_DISTFILES"
-
-    if is_url "$arg"; then
-        url="$arg"
-        fname=$(url_basename "$url")
-        dest="$XBUILD_DISTFILES/$fname"
-        if [ ! -f "$dest" ]; then
-            msg "fetching distfile (no hash required): $url"
-            fetch_url_to "$url" "$dest"
-        fi
-        sha=$(sha256_file "$dest")
-        printf '%s\n' "$sha"
-        printf '%s\n' "SOURCE_URL=\"$url\""
-        printf '%s\n' "SOURCE_SHA256=\"$sha\""
-        return 0
-    fi
-
-    recipe=$(resolve_recipe "$arg")
-    # shellcheck disable=SC1090
-    . "$recipe"
-    : "${PKGNAME:?recipe missing PKGNAME}"
-    : "${VERSION:?recipe missing VERSION}"
-
-    # Resolve URL/path without requiring SOURCE_SHA256.
-    if [ -n "${SOURCE_URL:-}" ]; then
-        url=$SOURCE_URL
-    elif [ -n "${SOURCE:-}" ] && is_url "$SOURCE"; then
-        url=$SOURCE
-    else
-        url=""
-    fi
-
-    if [ -n "$url" ]; then
-        fname=${SOURCE_FILE:-$(url_basename "$url")}
-        dest="$XBUILD_DISTFILES/$fname"
-        if [ ! -f "$dest" ]; then
-            msg "fetching distfile (no hash required): $url"
-            fetch_url_to "$url" "$dest"
-        fi
-        sha=$(sha256_file "$dest")
-        printf '%s\n' "$sha"
-        printf '%s\n' "SOURCE_URL=\"$url\""
-        printf '%s\n' "SOURCE_SHA256=\"$sha\""
-        return 0
-    fi
-
-    : "${SOURCE:?recipe missing SOURCE or SOURCE_URL}"
-    [ -f "$SOURCE" ] || die "SOURCE not found: $SOURCE"
-    sha=$(sha256_file "$SOURCE")
-    printf '%s\n' "$sha"
-    printf '%s\n' "SOURCE=\"$SOURCE\""
-    printf '%s\n' "SOURCE_SHA256=\"$sha\""
-}
-
-
-fetch_url_to() {
-    url=$1 out=$2
-    tmp="$out.part.$$"
-    rm -f "$tmp"
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -L --fail --retry 3 --retry-delay 1 -o "$tmp" "$url" || {
-            rm -f "$tmp"
-            die "fetch failed (curl): $url"
-        }
-    elif command -v wget >/dev/null 2>&1; then
-        wget -O "$tmp" "$url" || {
-            rm -f "$tmp"
-            die "fetch failed (wget): $url"
-        }
-    else
-        die "no fetch tool found (need curl or wget)"
-    fi
-
-    mv "$tmp" "$out"
-}
-
-fetch_distfile() {
-    # Inputs: SOURCE (local path) OR SOURCE_URL (remote), and optional SOURCE_FILE name.
-    # Outputs: echoes the resolved local distfile path.
-    : "${PKGNAME:?recipe missing PKGNAME}"
-    : "${VERSION:?recipe missing VERSION}"
-
-    mkdirp "$XBUILD_DISTFILES"
-
-    # Determine URL/path
-    if [ -n "${SOURCE_URL:-}" ]; then
-        url=$SOURCE_URL
-    elif [ -n "${SOURCE:-}" ] && is_url "$SOURCE"; then
-        url=$SOURCE
-    else
-        url=""
-    fi
-
-    if [ -n "$url" ]; then
-        fname=${SOURCE_FILE:-$(url_basename "$url")}
-        dest="$XBUILD_DISTFILES/$fname"
-
-        if [ -f "$dest" ]; then
-            # Verify cached file before use.
-            if [ -n "${SOURCE_SHA256:-}" ]; then
-                verify_sha256 "$dest" "$SOURCE_SHA256"
-            fi
-            printf '%s\n' "$dest"
-            return 0
-        fi
-
-        msg "fetching distfile: $url"
-        fetch_url_to "$url" "$dest"
-
-        if [ -n "${SOURCE_SHA256:-}" ]; then
-            verify_sha256 "$dest" "$SOURCE_SHA256"
-        else
-            die "SOURCE_SHA256 is required for remote sources (PKGNAME=$PKGNAME)"
-        fi
-
-        printf '%s\n' "$dest"
-        return 0
-    fi
-
-    # Local source path case
-    : "${SOURCE:?recipe missing SOURCE or SOURCE_URL}"
-    [ -f "$SOURCE" ] || die "SOURCE not found: $SOURCE"
-    if [ -n "${SOURCE_SHA256:-}" ]; then
-        verify_sha256 "$SOURCE" "$SOURCE_SHA256"
-    fi
-    printf '%s\n' "$SOURCE"
-}
-
-cmd_fetch_recipe() {
-    recipe=$1
-    [ -f "$recipe" ] || die "recipe not found: $recipe"
-    # shellcheck disable=SC1090
-    . "$recipe"
-
-    : "${PKGNAME:?recipe missing PKGNAME}"
-    : "${VERSION:?recipe missing VERSION}"
-
-    # Resolve/fetch distfile and verify checksum.
-    dist=$(fetch_distfile)
-    msg "distfile ready: $dist"
-}
-
-cmd_distfiles_ls() {
-    mkdirp "$XBUILD_DISTFILES"
-    ls -l "$XBUILD_DISTFILES"
-}
-
-cmd_distfiles_prune_partials() {
-    mkdirp "$XBUILD_DISTFILES"
-    # Remove orphaned partial downloads (*.part.*)
-    find "$XBUILD_DISTFILES" -maxdepth 1 -type f -name '*.part.*' -print | while IFS= read -r f; do
-        rm -f "$f" 2>/dev/null || true
+# lock via mkdir (atomic on POSIX)
+LOCKDIR=
+lock_acquire() {
+    LOCKDIR="$XBUILD_WORK/.lock"
+    i=0
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        i=$((i+1))
+        [ "$i" -le 120 ] || die "lock timeout (another xbuild running?)"
+        sleep 1
     done
-    msg "pruned partial downloads in: $XBUILD_DISTFILES"
+    echo "$$" >"$LOCKDIR/pid" 2>/dev/null || :
+}
+lock_release() {
+    [ -n "${LOCKDIR:-}" ] || return 0
+    safe_rm_rf "$LOCKDIR"
+    LOCKDIR=
 }
 
-###############################################################################
-# Archive handling (hardened)
-###############################################################################
+cleanup() {
+    st=$?
+    # best effort cleanup of temp dir
+    [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ] && safe_rm_rf "$XBUILD_TMPDIR"
+    lock_release
+    exit "$st"
+}
+trap cleanup INT TERM HUP EXIT
 
-validate_paths_stream() {
-    # Reject absolute paths and any '..' component.
-    awk '
-        BEGIN{bad=0}
-        {
-            if ($0 ~ /^\/+/) bad=1
-            if ($0 ~ /(^|\/)\.\.(\/|$)/) bad=1
-        }
-        END{exit bad}
-    '
+# -------- Usage --------
+usage() {
+cat <<'EOF'
+xbuild - minimal source fetch/build/install manager
+
+USAGE:
+  xbuild <cmd> [options] <pkg>
+  xbuild <cmd> [options] <category/pkg>
+
+COMMANDS (and abbreviations):
+  fetch      (f)     Download source tarball + verify SHA256 + store in cache
+  build      (b)     Unpack + build in isolated build dir
+  install    (i)     Stage install into DESTDIR + register + then copy into ROOTFS
+  remove     (r)     Uninstall registered files from ROOTFS
+  list       (ls)    List installed packages
+  info       (in)    Show recipe + installed metadata
+  clean      (cl)    Remove build/staging dirs for a package (keeps sources)
+  help       (h)     Show help
+
+OPTIONS (apply to fetch/build/install/remove/info/clean where relevant):
+  -R, --rootfs PATH       Final root (default: /)
+  -P, --prefix PATH       Prefix inside ROOTFS (default: /usr)
+  -r, --recipes PATH      Recipes directory (default: /etc/xbuild/recipes)
+  -j, --jobs N            Parallel jobs (default: detected CPU count)
+  -k, --keep-build         Keep build dir after success
+  -y, --yes               Assume "yes" for prompts
+  -q, --quiet             Less output
+  -v, --verbose           More output
+
+ENV overrides:
+  XBUILD_ROOTFS XBUILD_PREFIX XBUILD_RECIPES XBUILD_WORK XBUILD_CACHE XBUILD_SOURCES
+  XBUILD_BUILDDIR XBUILD_STAGING XBUILD_DB XBUILD_LOGS XBUILD_JOBS XBUILD_KEEP_BUILD
+  XBUILD_ASSUME_YES XBUILD_STRICT
+
+RECIPE FORMAT:
+  Put a recipe file at:
+    $XBUILD_RECIPES/<category>/<name>.sh
+
+  Required variables:
+    PKG_NAME, PKG_VERSION, PKG_URL, PKG_SHA256
+  Optional variables:
+    PKG_ARCHIVE   (filename; default derived from URL)
+    PKG_DIRNAME   (dir inside archive; default derived)
+    PKG_SITE      (homepage/info)
+    PKG_LICENSE
+    PKG_DEPENDS   (space-separated)
+    PKG_BUILD_SYSTEM: autotools|cmake|meson|make|custom (default: autotools)
+    PKG_CONFIGURE_OPTS
+    PKG_MAKE_OPTS
+    PKG_INSTALL_OPTS
+    PKG_PATCHES   (space-separated patch file paths)
+    PKG_ENV       (extra VAR=VAL pairs exported during build/install)
+    PKG_PRE_BUILD, PKG_POST_BUILD (shell snippets; careful)
+    PKG_PRE_INSTALL, PKG_POST_INSTALL
+
+EXAMPLES:
+  xbuild fetch busybox
+  xbuild b base/busybox
+  xbuild i base/busybox -R /mnt/rootfs
+EOF
 }
 
-extract_postcheck_symlinks() {
-    out=$1
-    [ "$XBUILD_ALLOW_SYMLINKS" = "1" ] || return 0
-    # Verify all symlinks are relative and non-escaping.
-    # readlink is common; if unavailable, skip with warning (still safe for typical sources).
-    if command -v readlink >/dev/null 2>&1; then
-        find "$out" -type l 2>/dev/null | while IFS= read -r lnk; do
-            tgt=$(readlink "$lnk" || true)
-            [ -n "$tgt" ] || continue
-            case "$tgt" in
-                /*) die "unsafe symlink (absolute target) in extracted tree: $lnk -> $tgt" ;;
-            esac
-            # reject any .. component in target
-            printf '%s\n' "$tgt" | validate_paths_stream || die "unsafe symlink (escaping '..') in extracted tree: $lnk -> $tgt"
-        done
-    fi
-}
-
-extract_tar() {
-    arc=$1 out=$2
-    mkdirp "$out"
-    tar -tf "$arc" | validate_paths_stream || die "unsafe paths in tar archive: $arc"
-
-    if [ "$XBUILD_ALLOW_SYMLINKS" != "1" ]; then
-        # reject symlinks and hardlinks based on tar listing
-        tar -tvf "$arc" | awk '$1 ~ /^l/ {exit 1} $1 ~ /^h/ {exit 1} END{exit 0}' \
-            || die "archive contains symlinks/hardlinks but XBUILD_ALLOW_SYMLINKS=0: $arc"
-    fi
-
-    tar --no-same-owner --no-same-permissions -xf "$arc" -C "$out"
-    extract_postcheck_symlinks "$out"
-}
-
-extract_zip() {
-    arc=$1 out=$2
-    mkdirp "$out"
-    need unzip
-    unzip -Z1 "$arc" | validate_paths_stream || die "unsafe paths in zip archive: $arc"
-    unzip -oq "$arc" -d "$out"
-    extract_postcheck_symlinks "$out"
-}
-
-extract() {
-    arc=$1 out=$2
-    case "$arc" in
-        *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.tar.zst)
-            need tar
-            extract_tar "$arc" "$out"
-            ;;
-        *.zip)
-            extract_zip "$arc" "$out"
-            ;;
-        *)
-            die "unknown archive format: $arc"
-            ;;
-    esac
-    reject_newlines_in_tree "$out"
-}
-
-###############################################################################
-# Ownership DB (refcounted; safe for arbitrary paths)
-#
-# Storage layout:
-#   db/pkgs/<pkg>/files   (absolute paths installed by pkg)
-#   db/owners/<key>       (first line: PATH\t<abs-path>; next lines: PKG\t<pkg>)
-###############################################################################
-
-pkg_db_dir() { printf '%s\n' "$XBUILD_DB/pkgs/$1"; }
-owners_dir() { printf '%s\n' "$XBUILD_DB/owners"; }
-
-owner_key() {
-    # cksum is POSIX; returns "<crc> <bytes>".
-    # We include bytes to reduce collision risk in practice.
-    printf '%s' "$1" | cksum | awk '{print $1 "-" $2}'
-}
-
-owner_rec_path() {
-    path=$1
-    key=$(owner_key "$path")
-    printf '%s\n' "$(owners_dir)/$key"
-}
-
-owner_rec_ensure_matches_path() {
-    rec=$1 path=$2
-    if [ -f "$rec" ]; then
-        stored=$(awk -F '\t' '$1=="PATH"{print $2; exit}' "$rec" 2>/dev/null || true)
-        [ "$stored" = "$path" ] || die "owner DB key collision detected for path: $path"
+# -------- Logging --------
+QUIET=0
+VERBOSE=0
+logfile=
+run() {
+    # run <cmd...> : logs stdout+stderr
+    if [ "$QUIET" -eq 1 ]; then
+        "$@" >>"$logfile" 2>&1 || return $?
     else
-        mkdirp "$(owners_dir)"
-        printf 'PATH\t%s\n' "$path" >"$rec"
-    fi
-}
-
-owner_has_pkg() {
-    rec=$1 pkg=$2
-    awk -F '\t' -v p="$pkg" '$1=="PKG" && $2==p {found=1} END{exit (found?0:1)}' "$rec" 2>/dev/null
-}
-
-owner_add_pkg() {
-    path=$1 pkg=$2
-    rec=$(owner_rec_path "$path")
-    owner_rec_ensure_matches_path "$rec" "$path"
-    if owner_has_pkg "$rec" "$pkg"; then
-        return 0
-    fi
-    printf 'PKG\t%s\n' "$pkg" >>"$rec"
-}
-
-owner_remove_pkg() {
-    path=$1 pkg=$2
-    rec=$(owner_rec_path "$path")
-    [ -f "$rec" ] || return 0
-    owner_rec_ensure_matches_path "$rec" "$path"
-    # Keep PATH line + all other PKG lines except this pkg.
-    awk -F '\t' -v p="$pkg" '
-        $1=="PATH" {print; next}
-        $1=="PKG" && $2==p {next}
-        {print}
-    ' "$rec" >"$rec.tmp"
-    mv "$rec.tmp" "$rec"
-    # If no PKG lines remain, delete record.
-    if ! awk -F '\t' '$1=="PKG"{exit 0} END{exit 1}' "$rec"; then
-        rm -f "$rec"
-        return 1  # indicates: now unowned
+        "$@" 2>&1 | tee -a "$logfile" >/dev/null || return ${PIPESTATUS:-1}
     fi
     return 0
 }
 
-pkg_write_meta() {
-    pkg=$1 ver=$2 rec=$3
-    mkdirp "$(pkg_db_dir "$pkg")"
-    printf 'PKGNAME=%s\nVERSION=%s\nRECIPE=%s\nINSTALLED_AT=%s\n' "$pkg" "$ver" "$rec" "$(date +%s 2>/dev/null || echo 0)" >"$(pkg_db_dir "$pkg")/meta"
-}
-
-pkg_init() {
-    pkg=$1
-    mkdirp "$(pkg_db_dir "$pkg")"
-    : >"$(pkg_db_dir "$pkg")/files"
-}
-
-pkg_is_installed() { [ -d "$(pkg_db_dir "$1")" ]; }
-
-pkg_record_file() {
-    pkg=$1 path=$2
-    printf '%s\n' "$path" >>"$(pkg_db_dir "$pkg")/files"
-}
-
-###############################################################################
-# Install / Merge (collision safe)
-###############################################################################
-
-cp_supports_a() {
-    # Some minimal cp implementations don't support -a. Probe once.
-    if cp -a /dev/null /dev/null 2>/dev/null; then
-        return 0
+# POSIX sh does not have PIPESTATUS; emulate by avoiding tee in strict mode
+run_strict() {
+    if [ "$QUIET" -eq 1 ]; then
+        "$@" >>"$logfile" 2>&1
+        return $?
     fi
-    return 1
+    # Use a temp file and then cat to terminal to keep correct exit status.
+    tf="$XBUILD_TMPDIR/cmd.out"
+    : >"$tf" || die "cannot write temp output"
+    "$@" >>"$tf" 2>&1
+    rc=$?
+    cat "$tf" >>"$logfile" 2>/dev/null || :
+    cat "$tf" 1>&2
+    return $rc
 }
 
-install_entry() {
-    src=$1 dst=$2
-
-    # Ensure directory exists.
-    mkdirp "$(dirname "$dst")"
-
-    # Install symlink or regular file. We ignore device files and special nodes.
-    if [ -L "$src" ]; then
-        # Recreate symlink atomically-ish.
-        tgt=$(readlink "$src" 2>/dev/null || true)
-        [ -n "$tgt" ] || die "failed to read symlink: $src"
-        rm -f "$dst"
-        ln -s "$tgt" "$dst"
-    elif [ -f "$src" ]; then
-        if cp_supports_a; then
-            cp -a "$src" "$dst"
-        else
-            # Fallback: tar pipeline for a single file (no -p; no owner).
-            ( cd "$(dirname "$src")" && tar -cf - "$(basename "$src")" ) | ( cd "$(dirname "$dst")" && tar -xf - )
-        fi
-        if [ "$XBUILD_STRIP_SUID" = "1" ]; then
-            chmod ug-s "$dst" 2>/dev/null || true
-        fi
-    else
-        # Directories handled elsewhere; other types are ignored for safety.
-        return 0
-    fi
+# -------- Download --------
+downloader_detect() {
+    if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
+    if command -v wget >/dev/null 2>&1; then echo "wget"; return 0; fi
+    die "need curl or wget for downloads"
 }
 
-merge_tree() {
-    pkg=$1 staged=$2 root=$3
-
-    [ -d "$staged" ] || die "staged directory not found: $staged"
-    reject_newlines_in_tree "$staged"
-
-    # Install directories first (so later installs don't fail).
-    find "$staged" -type d 2>/dev/null | while IFS= read -r d; do
-        rel=${d#"$staged"/}
-        [ "$rel" != "$d" ] || rel=""  # root itself
-        [ -n "$rel" ] || continue
-        mkdirp "$root/$rel"
-    done
-
-    # Install files and symlinks.
-    find "$staged" \( -type f -o -type l \) 2>/dev/null | while IFS= read -r src; do
-        rel=${src#"$staged"/}
-        dst=$root/$rel
-
-        # Collision policy: if dst exists and is owned by another package -> abort.
-        if [ -e "$dst" ] || [ -L "$dst" ]; then
-            rec=$(owner_rec_path "$dst")
-            if [ -f "$rec" ]; then
-                # If owned by someone else, collision.
-                if ! owner_has_pkg "$rec" "$pkg"; then
-                    die "file collision: $dst already owned by another package"
-                fi
-                # Owned by same package: reinstall is allowed.
-            else
-                die "file collision: $dst already exists but is not tracked (refusing overwrite)"
-            fi
-        fi
-
-        install_entry "$src" "$dst"
-        owner_add_pkg "$dst" "$pkg"
-        pkg_record_file "$pkg" "$dst"
-    done
-}
-
-###############################################################################
-# Remove (safe; shared files kept)
-###############################################################################
-
-remove_pkg() {
-    pkg=$1
-    pkg_is_installed "$pkg" || die "package not installed: $pkg"
-
-    # Remove owned files if they become unowned.
-    files="$(pkg_db_dir "$pkg")/files"
-    [ -f "$files" ] || die "corrupt DB for $pkg (missing files list)"
-
-    # Track directories for cleanup (best-effort).
-    tmpdirs="$XBUILD_WORK/.rm-dirs.$$"
-    : >"$tmpdirs"
-
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-
-        # Remove ownership; if unowned, delete file.
-        if owner_remove_pkg "$path" "$pkg"; then
-            : # still owned by someone else; keep file
-        else
-            # unowned now; delete file/symlink
-            rm -f "$path" 2>/dev/null || true
-            # queue dir cleanup
-            printf '%s\n' "$(dirname "$path")" >>"$tmpdirs"
-        fi
-    done <"$files"
-
-    # Cleanup empty dirs, deepest first.
-    # We sort by length desc; safe enough for typical trees.
-    awk '{print length($0) "\t" $0}' "$tmpdirs" | sort -rn | awk -F '\t' '{print $2}' | \
-    while IFS= read -r d; do
-        [ -n "$d" ] || continue
-        # Never attempt to remove root directory.
-        [ "$d" = "/" ] && continue
-        rmdir "$d" 2>/dev/null || true
-    done
-
-    rm -f "$tmpdirs"
-    rm -rf "$(pkg_db_dir "$pkg")"
-    msg "removed: $pkg"
-}
-
-###############################################################################
-# Dependency graph (simple, no version solving; cycle detection)
-#
-# Recipe metadata:
-#   DEPENDS="pkg1 pkg2"            # package names resolved via XBUILD_RECIPES_DIR/<pkg>.recipe
-#   DEPENDS_RECIPES="path1 path2"  # explicit recipe paths (optional)
-###############################################################################
-
-is_recipe_path() {
-    case "$1" in
-        */*|*.recipe) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-resolve_recipe() {
-    tok=$1
-
-    # Direct path
-    if is_recipe_path "$tok"; then
-        [ -f "$tok" ] || die "dependency recipe not found: $tok"
-        printf '%s\n' "$tok"
-        return 0
-    fi
-
-    # category/program form (e.g., "base/zlib")
-    case "$tok" in
-        */*)
-            cat=${tok%%/*}
-            prog=${tok#*/}
-            p1="$XBUILD_RECIPES_DIR/$cat/$prog/recipe"
-            p2="$XBUILD_RECIPES_DIR/$cat/$prog/$prog.recipe"
-            p3="$XBUILD_RECIPES_DIR/$cat/$prog.recipe"
-            if [ -f "$p1" ]; then printf '%s\n' "$p1"; return 0; fi
-            if [ -f "$p2" ]; then printf '%s\n' "$p2"; return 0; fi
-            if [ -f "$p3" ]; then printf '%s\n' "$p3"; return 0; fi
-            die "recipe for '$tok' not found (tried: $p1, $p2, $p3)"
+download_file() {
+    url=$1; out=$2
+    dl=$(downloader_detect)
+    case "$dl" in
+        curl)
+            tlsflag=
+            [ "$XBUILD_VERIFY_TLS" = "0" ] && tlsflag="-k"
+            run_strict curl $tlsflag -L --fail --retry 3 --retry-delay 2 -o "$out" "$url"
+            ;;
+        wget)
+            # wget validates TLS by default (unless configured otherwise)
+            run_strict wget -O "$out" "$url"
             ;;
     esac
+}
 
-    # simple package name
-    p="$XBUILD_RECIPES_DIR/$tok.recipe"
-    if [ -f "$p" ]; then
-        printf '%s\n' "$p"
-        return 0
+sha256_check() {
+    file=$1; expected=$2
+    need_cmd sha256sum
+    got=$(sha256sum "$file" | awk '{print $1}')
+    [ "$got" = "$expected" ] || die "sha256 mismatch for $(basename "$file"): expected $expected got $got"
+}
+
+# -------- Recipe loading --------
+recipe_find() {
+    arg=$1
+    case "$arg" in
+        */*) cat=${arg%/*}; name=${arg##*/};;
+        *) cat=""; name="$arg";;
+    esac
+    if [ -n "$cat" ]; then
+        f="$XBUILD_RECIPES/$cat/$name.sh"
+        [ -f "$f" ] && { echo "$f"; return 0; }
+        die "recipe not found: $arg (expected $f)"
     fi
-
-    # fallback: search unique match in category/program layout: recipes/*/<tok>/recipe
-    found=""
-    for cand in "$XBUILD_RECIPES_DIR"/*/"$tok"/recipe; do
-        if [ -f "$cand" ]; then
-            if [ -n "$found" ] && [ "$found" != "$cand" ]; then
-                die "ambiguous package '$tok' (multiple recipes found). Use category/program."
-            fi
-            found="$cand"
-        fi
-    done
-    if [ -n "$found" ]; then
-        printf '%s\n' "$found"
-        return 0
-    fi
-
-    die "dependency recipe for '$tok' not found under: $XBUILD_RECIPES_DIR"
+    # search by name
+    # shellcheck disable=SC2012
+    f=$(ls -1 "$XBUILD_RECIPES"/*/"$name".sh 2>/dev/null | awk 'NR==1{print;exit}')
+    [ -n "$f" ] && [ -f "$f" ] && { echo "$f"; return 0; }
+    die "recipe not found by name: $name"
 }
 
-
-# Read recipe and print: "<pkgname>\t<recipepath>"
-recipe_id() {
-    r=$1
-    [ -f "$r" ] || die "recipe not found: $r"
-    # Source in a subshell to avoid leaking vars into caller.
-    (
-        # shellcheck disable=SC1090
-        . "$r"
-        : "${PKGNAME:?recipe missing PKGNAME}"
-        printf '%s\t%s\n' "$PKGNAME" "$r"
-    )
-}
-
-# List dependency recipe paths (one per line) for a given recipe path.
-recipe_deps() {
-    r=$1
-    (
-        # shellcheck disable=SC1090
-        . "$r"
-        # DEPENDS_RECIPES may contain recipe paths; DEPENDS contains package names.
-        for t in ${DEPENDS_RECIPES:-}; do
-            resolve_recipe "$t"
-        done
-        for p in ${DEPENDS:-}; do
-            resolve_recipe "$p"
-        done
-    )
-}
-
-# Topological sort with cycle detection (DFS).
-# Output: recipe paths in build order (deps first).
-# Topological sort with cycle detection (DFS).
-# Output: recipe paths in build order (deps first).
-# Accepts 1..N root recipe paths.
-toposort_recipes() {
-    state="$XBUILD_WORK/.depstate.$$"
-    mkdirp "$state/tmp" "$state/perm" "$state/map"
-    order="$state/order"
-    : >"$order"
-
-    visit() {
-        rpath=$1
-        id="$(recipe_id "$rpath")"
-        pkg="${id%%	*}"
-
-        if [ -f "$state/perm/$pkg" ]; then
-            return 0
-        fi
-        if [ -f "$state/tmp/$pkg" ]; then
-            die "dependency cycle detected at package: $pkg (recipe $rpath)"
-        fi
-
-        : >"$state/tmp/$pkg"
-        printf '%s\n' "$rpath" >"$state/map/$pkg"
-
-        depsfile="$state/deps.$pkg.$$"
-        : >"$depsfile"
-        recipe_deps "$rpath" >"$depsfile"
-
-        while IFS= read -r dep; do
-            [ -n "$dep" ] || continue
-            visit "$dep"
-        done <"$depsfile"
-
-        rm -f "$depsfile"
-        rm -f "$state/tmp/$pkg"
-        : >"$state/perm/$pkg"
-        printf '%s\n' "$rpath" >>"$order"
-    }
-
-    # Visit each root in order
-    for r in "$@"; do
-        visit "$r"
-    done
-
-    cat "$order"
-}
-
-
-
-###############################################################################
-# Recipe 'files/' overlay support
-# If <recipe-dir>/files exists, its contents are copied into the staging root
-# after install() runs. Paths are relative to filesystem root.
-###############################################################################
-
-overlay_files_dir() {
-    filesdir=$1
-    staged=$2
-    [ -d "$filesdir" ] || return 0
-    reject_newlines_in_tree "$filesdir"
-
-    # Copy preserving symlinks. Prefer tar pipeline to avoid cp -a portability issues.
-    ( cd "$filesdir" && tar -cf - . ) | ( cd "$staged" && tar -xf - )
-}
-
-
-###############################################################################
-# Build orchestration
-###############################################################################
-
-# Recipe contract:
-#   Required vars: PKGNAME, VERSION, SOURCE
-#   Required functions: build(), install()
-#   Optional vars: WORKDIR_SUBDIR (if archive expands into a single subdir)
-#
-# SOURCE is a local path to a distfile (fetch/checksum will be added later).
-#
-# build() should compile in $builddir using sources in $srcdir (or $sourcedir).
-# install() must install into $DESTDIR (already set) with a prefix relative to / (standard).
-#
-# Example install: make DESTDIR="$DESTDIR" install
-
-build_pkg() {
-    recipe=$1
-    [ -f "$recipe" ] || die "recipe not found: $recipe"
+recipe_load() {
+    recipe_file=$1
+    # Reset variables to avoid leakage between runs
+    PKG_NAME= PKG_VERSION= PKG_URL= PKG_SHA256=
+    PKG_ARCHIVE= PKG_DIRNAME= PKG_SITE= PKG_LICENSE=
+    PKG_DEPENDS= PKG_BUILD_SYSTEM= PKG_CONFIGURE_OPTS=
+    PKG_MAKE_OPTS= PKG_INSTALL_OPTS= PKG_PATCHES=
+    PKG_ENV= PKG_PRE_BUILD= PKG_POST_BUILD= PKG_PRE_INSTALL= PKG_POST_INSTALL=
     # shellcheck disable=SC1090
-    . "$recipe"
-
-    : "${PKGNAME:?recipe missing PKGNAME}"
-    : "${VERSION:?recipe missing VERSION}"
-    : "${SOURCE:?recipe missing SOURCE}"
-
-    mkdirp "$XBUILD_WORK"
-    work="$XBUILD_WORK/$PKGNAME-$VERSION"
-    srcdir="$work/src"
-    builddir="$work/build"
-    staged="$work/stage"
-
-    rm -rf "$work"
-    mkdirp "$srcdir" "$builddir" "$staged"
-
-    msg "preparing distfile: $PKGNAME-$VERSION"
-    distfile=$(fetch_distfile)
-
-    msg "extracting: $PKGNAME-$VERSION"
-    extract "$distfile" "$srcdir"
-
-    # Determine the effective source directory.
-    sourcedir="$srcdir"
-    if [ -n "${WORKDIR_SUBDIR:-}" ] && [ -d "$srcdir/$WORKDIR_SUBDIR" ]; then
-        sourcedir="$srcdir/$WORKDIR_SUBDIR"
-    else
-        # Common case: tarball creates exactly one top-level directory.
-        topcount=$(find "$srcdir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk 'END{print NR}')
-        if [ "$topcount" = "1" ]; then
-            onlydir=$(find "$srcdir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
-            [ -n "$onlydir" ] && sourcedir="$onlydir"
-        fi
+    . "$recipe_file" || die "failed to source recipe: $recipe_file"
+    [ -n "$PKG_NAME" ] || die "recipe missing PKG_NAME ($recipe_file)"
+    [ -n "$PKG_VERSION" ] || die "recipe missing PKG_VERSION ($recipe_file)"
+    [ -n "$PKG_URL" ] || die "recipe missing PKG_URL ($recipe_file)"
+    [ -n "$PKG_SHA256" ] || die "recipe missing PKG_SHA256 ($recipe_file)"
+    : "${PKG_BUILD_SYSTEM:=autotools}"
+    if [ -z "$PKG_ARCHIVE" ]; then
+        PKG_ARCHIVE=${PKG_URL##*/}
+        [ -n "$PKG_ARCHIVE" ] || die "cannot derive PKG_ARCHIVE from URL"
     fi
-
-    XBUILD_RECIPE_DIR=$(dirname "$recipe")
-
-    msg "building: $PKGNAME-$VERSION"
-    (
-        cd "$builddir"
-
-        export DESTDIR="$staged"
-        export MAKEFLAGS="-j$XBUILD_JOBS"
-
-        if [ "$XBUILD_INSTALL_MODE" = "sysroot" ] && [ "$XBUILD_STRICT_SYSROOT" = "1" ]; then
-            export PKG_CONFIG_SYSROOT_DIR="$XBUILD_SYSROOT"
-            # Prefer sysroot pkg-config dirs; users can extend as needed.
-            export PKG_CONFIG_LIBDIR="$XBUILD_SYSROOT/lib/pkgconfig:$XBUILD_SYSROOT/usr/lib/pkgconfig:$XBUILD_SYSROOT/share/pkgconfig:$XBUILD_SYSROOT/usr/share/pkgconfig"
-        fi
-
-        # Provide standard pointers for recipes.
-        export XBUILD_SRCDIR="$sourcedir"
-        export XBUILD_BUILDDIR="$builddir"
-
-        command -v build >/dev/null 2>&1 || die "recipe missing build() function"
-        command -v install >/dev/null 2>&1 || die "recipe missing install() function"
-
-        build
-        install
-
-        # Overlay static files from recipe directory (if present)
-        overlay_files_dir "$XBUILD_RECIPE_DIR/files" "$staged"
-    )
-
-    root="$(target_root)"
-    msg "installing into: $root"
-    mkdirp "$XBUILD_DB"
-    pkg_init "$PKGNAME"
-    pkg_write_meta "$PKGNAME" "$VERSION" "$recipe"
-    merge_tree "$PKGNAME" "$staged" "$root"
-    msg "installed: $PKGNAME"
+    if [ -z "$PKG_DIRNAME" ]; then
+        # heuristics: strip common archive suffixes
+        d=$PKG_ARCHIVE
+        for suf in .tar.gz .tgz .tar.xz .tar.bz2 .tbz2 .tar.zst .zip; do
+            case "$d" in *"$suf") d=${d%"$suf"};; esac
+        done
+        PKG_DIRNAME=$d
+    fi
+    PKG_ID=$(printf '%s-%s' "$PKG_NAME" "$PKG_VERSION")
+    PKG_CAT=$(basename "$(dirname "$recipe_file")" 2>/dev/null || echo "unknown")
+    PKG_REF="$PKG_CAT/$PKG_NAME"
 }
 
-###############################################################################
-# Status / diagnostics
-###############################################################################
+# -------- Build paths --------
+paths_init() {
+    mkp "$XBUILD_WORK"
+    mkp "$XBUILD_CACHE"
+    mkp "$XBUILD_SOURCES"
+    mkp "$XBUILD_BUILDDIR"
+    mkp "$XBUILD_STAGING"
+    mkp "$XBUILD_DB"
+    mkp "$XBUILD_LOGS"
+    XBUILD_TMPDIR="$XBUILD_WORK/tmp.$$"
+    mkp "$XBUILD_TMPDIR"
+    SRCFILE="$XBUILD_SOURCES/$PKG_ARCHIVE"
+    BUILDD="$XBUILD_BUILDDIR/$PKG_ID"
+    STAGED="$XBUILD_STAGING/$PKG_ID"
+    PKG_DB="$XBUILD_DB/$PKG_ID"
+    mkp "$PKG_DB"
+    logfile="$XBUILD_LOGS/$PKG_ID.$CMD.$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S').log"
+    : >"$logfile" || die "cannot write log: $logfile"
+}
 
-cmd_status() {
-    # usage: xbuild status [--verbose]
-    verbose=0
-    if [ "${1:-}" = "--verbose" ]; then
-        verbose=1
-    fi
-
-    mkdirp "$XBUILD_DB"
-    pkgs_dir="$XBUILD_DB/pkgs"
-    owners_dir_path="$(owners_dir)"
-
-    printf '%s\n' "xbuild $XBUILD_VERSION"
-    printf '%s\n' "DB: $XBUILD_DB"
-    printf '%s\n' "Distfiles: ${XBUILD_DISTFILES:-}"
-    printf '%s\n' ""
-
-    if [ ! -d "$pkgs_dir" ]; then
-        printf '%s\n' "Installed packages: (none)"
-    else
-        printf '%s\n' "Installed packages:"
-        for d in "$pkgs_dir"/*; do
-            [ -d "$d" ] || continue
-            pkg=$(basename "$d")
-            meta="$d/meta"
-            if [ -f "$meta" ]; then
-                ver=$(awk -F= '$1=="VERSION"{print $2}' "$meta" 2>/dev/null || true)
-                printf '  - %s %s\n' "$pkg" "${ver:-}"
-            else
-                printf '  - %s\n' "$pkg"
-            fi
+# -------- Unpack / patch --------
+unpack_source() {
+    safe_rm_rf "$BUILDD" 2>/dev/null || :
+    mkp "$BUILDD"
+    case "$SRCFILE" in
+        *.tar.gz|*.tgz)   run_strict tar -xzf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.xz)         run_strict tar -xJf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.bz2|*.tbz2) run_strict tar -xjf "$SRCFILE" -C "$BUILDD" ;;
+        *.tar.zst)        need_cmd zstd; run_strict tar --use-compress-program=zstd -xf "$SRCFILE" -C "$BUILDD" ;;
+        *.zip)            need_cmd unzip; run_strict unzip -q "$SRCFILE" -d "$BUILDD" ;;
+        *) die "unknown archive format: $SRCFILE" ;;
+    esac
+    SRCDIR="$BUILDD/$PKG_DIRNAME"
+    [ -d "$SRCDIR" ] || {
+        # try single top-level directory detection
+        d=$(find "$BUILDD" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk 'NR==1{print;exit}')
+        [ -n "$d" ] && SRCDIR="$d"
+        [ -d "$SRCDIR" ] || die "source dir not found after unpack (expected $BUILDD/$PKG_DIRNAME)"
+    }
+    if [ -n "${PKG_PATCHES:-}" ]; then
+        need_cmd patch
+        for p in $PKG_PATCHES; do
+            [ -f "$p" ] || die "patch not found: $p"
+            msg "applying patch: $p"
+            (cd "$SRCDIR" && run_strict patch -p1 <"$p") || die "patch failed: $p"
         done
     fi
+}
 
-    printf '%s\n' ""
-    printf '%s\n' "Owners summary:"
-    shared_count=0
-    orphan_count=0
-    inconsist_count=0
+# -------- Build / Install logic --------
+export_env() {
+    # Common env; allow recipes to add PKG_ENV
+    # NOTE: do not export CC/CFLAGS by default; user can set in environment or recipe.
+    export PREFIX="$XBUILD_PREFIX"
+    export DESTDIR="$STAGED/destdir"
+    export MAKEFLAGS="-j$XBUILD_JOBS"
+    # extra environment pairs
+    if [ -n "${PKG_ENV:-}" ]; then
+        for kv in $PKG_ENV; do
+            # kv must be VAR=VAL
+            case "$kv" in *=*) export "$kv" ;; *) die "invalid PKG_ENV token (need VAR=VAL): $kv" ;; esac
+        done
+    fi
+}
 
-    if [ -d "$owners_dir_path" ]; then
-        for rec in "$owners_dir_path"/*; do
-            [ -f "$rec" ] || continue
-            path=$(awk -F '\t' '$1=="PATH"{print $2; exit}' "$rec" 2>/dev/null || true)
-            [ -n "$path" ] || continue
+do_build() {
+    export_env
+    # shell snippets (advanced; keep optional)
+    [ -n "${PKG_PRE_BUILD:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_PRE_BUILD") || :
+    case "$PKG_BUILD_SYSTEM" in
+        autotools)
+            [ -x "$SRCDIR/configure" ] || die "configure not found (set PKG_BUILD_SYSTEM or PKG_DIRNAME): $SRCDIR"
+            (cd "$SRCDIR" && run_strict ./configure --prefix="$XBUILD_PREFIX" $PKG_CONFIGURE_OPTS) || die "configure failed"
+            (cd "$SRCDIR" && run_strict make $PKG_MAKE_OPTS) || die "make failed"
+            ;;
+        cmake)
+            need_cmd cmake
+            mkp "$SRCDIR/.xbuild-cmake"
+            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake -DCMAKE_INSTALL_PREFIX="$XBUILD_PREFIX" $PKG_CONFIGURE_OPTS ..) || die "cmake configure failed"
+            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --build . -- -j"$XBUILD_JOBS" $PKG_MAKE_OPTS) || die "cmake build failed"
+            ;;
+        meson)
+            need_cmd meson; need_cmd ninja
+            mkp "$SRCDIR/.xbuild-meson"
+            (cd "$SRCDIR" && run_strict meson setup .xbuild-meson --prefix "$XBUILD_PREFIX" $PKG_CONFIGURE_OPTS) || die "meson setup failed"
+            (cd "$SRCDIR/.xbuild-meson" && run_strict ninja) || die "ninja build failed"
+            ;;
+        make)
+            (cd "$SRCDIR" && run_strict make $PKG_MAKE_OPTS) || die "make failed"
+            ;;
+        custom)
+            [ -n "${PKG_CUSTOM_BUILD:-}" ] || die "PKG_BUILD_SYSTEM=custom requires PKG_CUSTOM_BUILD"
+            (cd "$SRCDIR" && sh -c "$PKG_CUSTOM_BUILD") || die "custom build failed"
+            ;;
+        *)
+            die "unknown PKG_BUILD_SYSTEM: $PKG_BUILD_SYSTEM"
+            ;;
+    esac
+    [ -n "${PKG_POST_BUILD:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_POST_BUILD") || :
+}
 
-            # count owners
-            n=$(awk -F '\t' '$1=="PKG"{c++} END{print c+0}' "$rec" 2>/dev/null)
-            if [ "$n" -gt 1 ]; then
-                shared_count=$((shared_count+1))
-                if [ $verbose -eq 1 ]; then
-                    printf '  SHARED: %s\n' "$path"
-                fi
-            fi
-
-            # orphaned file
-            if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-                orphan_count=$((orphan_count+1))
-                if [ $verbose -eq 1 ]; then
-                    printf '  ORPHAN FILE MISSING: %s\n' "$path"
-                fi
-            fi
-
-            # owner refers to non-installed package
-            awk -F '\t' -v db="$pkgs_dir" '
-                $1=="PKG"{
-                    cmd="[ -d \"" db "/" $2 "\" ]"
-                    if (system(cmd)!=0) exit 42
-                }
-                END{exit 0}
-            ' "$rec" 2>/dev/null || {
-                inconsist_count=$((inconsist_count+1))
-                if [ $verbose -eq 1 ]; then
-                    printf '  INCONSISTENT OWNER RECORD: %s\n' "$path"
-                fi
+do_stage_install() {
+    export_env
+    safe_rm_rf "$DESTDIR" 2>/dev/null || :
+    mkp "$DESTDIR"
+    [ -n "${PKG_PRE_INSTALL:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_PRE_INSTALL") || :
+    case "$PKG_BUILD_SYSTEM" in
+        autotools|make)
+            (cd "$SRCDIR" && run_strict make DESTDIR="$DESTDIR" install $PKG_INSTALL_OPTS) || die "install failed"
+            ;;
+        cmake)
+            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --install . --prefix "$XBUILD_PREFIX" --strip $PKG_INSTALL_OPTS --) || {
+                # older cmake may not support --strip/--prefix as used; fallback
+                (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --install . --prefix "$XBUILD_PREFIX") || die "cmake install failed"
             }
-        done
+            # cmake installs to DESTDIR if env is set
+            ;;
+        meson)
+            (cd "$SRCDIR/.xbuild-meson" && run_strict ninja install) || die "meson install failed"
+            ;;
+        custom)
+            [ -n "${PKG_CUSTOM_INSTALL:-}" ] || die "PKG_BUILD_SYSTEM=custom requires PKG_CUSTOM_INSTALL"
+            (cd "$SRCDIR" && sh -c "$PKG_CUSTOM_INSTALL") || die "custom install failed"
+            ;;
+    esac
+    [ -n "${PKG_POST_INSTALL:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_POST_INSTALL") || :
+}
+
+manifest_write() {
+    mkp "$PKG_DB"
+    MANIFEST="$PKG_DB/manifest.txt"
+    META="$PKG_DB/meta.txt"
+    : >"$MANIFEST" || die "cannot write manifest"
+    # record files relative to ROOTFS, excluding directories
+    (cd "$DESTDIR" && find . -type f -o -type l) | sed 's|^\./||' | sort >"$MANIFEST"
+    {
+        echo "pkg_id=$PKG_ID"
+        echo "name=$PKG_NAME"
+        echo "version=$PKG_VERSION"
+        echo "ref=$PKG_REF"
+        echo "prefix=$XBUILD_PREFIX"
+        echo "rootfs=$XBUILD_ROOTFS"
+        echo "build_system=$PKG_BUILD_SYSTEM"
+        echo "url=$PKG_URL"
+        echo "sha256=$PKG_SHA256"
+        echo "built_at=$(now_utc)"
+    } >"$META"
+}
+
+copy_to_rootfs() {
+    # Basic sanity
+    is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
+    is_abs "$XBUILD_PREFIX" || die "prefix must be absolute: $XBUILD_PREFIX"
+    [ -d "$DESTDIR" ] || die "missing DESTDIR: $DESTDIR"
+    [ -d "$XBUILD_ROOTFS" ] || die "rootfs not found: $XBUILD_ROOTFS"
+
+    # Install requires write perms; if ROOTFS="/" then typically root.
+    if [ "$XBUILD_ROOTFS" = "/" ]; then
+        [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] || warn "installing to / usually requires root"
     fi
 
-    printf '  shared paths: %s\n' "$shared_count"
-    printf '  missing files: %s\n' "$orphan_count"
-    printf '  inconsistent records: %s\n' "$inconsist_count"
+    # Copy using tar pipeline to preserve permissions and symlinks in a POSIX-ish way
+    (cd "$DESTDIR" && tar -cf - .) | (cd "$XBUILD_ROOTFS" && tar -xpf -) || die "copy into rootfs failed"
+}
 
-    printf '%s\n' ""
-    printf '%s\n' "Collision checks:"
-    # Check pkg files lists vs owner DB
-    if [ -d "$pkgs_dir" ]; then
-        for d in "$pkgs_dir"/*; do
-            [ -d "$d" ] || continue
-            pkg=$(basename "$d")
-            files="$d/files"
-            [ -f "$files" ] || continue
-            while IFS= read -r path; do
-                [ -n "$path" ] || continue
-                rec="$(owner_rec_path "$path")"
-                if [ ! -f "$rec" ]; then
-                    printf '  UNTRACKED-IN-OWNERS: %s (from %s)\n' "$path" "$pkg"
-                    continue
-                fi
-                if ! owner_has_pkg "$rec" "$pkg"; then
-                    printf '  OWNER-MISMATCH: %s (expected owner %s)\n' "$path" "$pkg"
-                fi
-            done <"$files"
-        done
+register_and_finalize() {
+    manifest_write
+    copy_to_rootfs
+    msg "installed: $PKG_ID -> rootfs=$XBUILD_ROOTFS"
+    msg "manifest: $MANIFEST"
+    msg "log: $logfile"
+}
+
+pkg_installed() {
+    [ -f "$XBUILD_DB/$1/meta.txt" ]
+}
+
+do_remove() {
+    pkgid=$1
+    db="$XBUILD_DB/$pkgid"
+    [ -d "$db" ] || die "not installed: $pkgid"
+    mf="$db/manifest.txt"
+    meta="$db/meta.txt"
+    [ -f "$mf" ] || die "missing manifest: $mf"
+
+    rootfs="$XBUILD_ROOTFS"
+    # If meta recorded a different rootfs, prefer explicit -R/--rootfs; else warn.
+    if [ -f "$meta" ]; then
+        rec_rootfs=$(awk -F= '$1=="rootfs"{print $2}' "$meta" 2>/dev/null | awk 'NR==1{print;exit}')
+        [ -n "$rec_rootfs" ] && [ "$rec_rootfs" != "$rootfs" ] && warn "recipe installed with rootfs=$rec_rootfs; removing from rootfs=$rootfs"
+    fi
+
+    confirm "This will remove files for $pkgid from $rootfs. Continue?" || die "aborted"
+    # Remove files in reverse path length to reduce dir-empty issues; ignore missing files
+    awk '{print length, $0}' "$mf" | sort -rn | cut -d" " -f2- |
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        f="$rootfs/$rel"
+        if [ -e "$f" ] || [ -L "$f" ]; then
+            rm -f -- "$f" 2>/dev/null || rm -f "$f" || die "cannot remove: $f"
+        fi
+    done
+    # Optionally remove empty directories under prefix path, best-effort
+    # shellcheck disable=SC2016
+    (cd "$rootfs" && awk -F/ '{NF--; print}' "$mf" | sed 's|/|/|g' | sort -u |
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            rmdir -- "$d" 2>/dev/null || :
+        done) || :
+    safe_rm_rf "$db"
+    msg "removed: $pkgid"
+}
+
+# -------- Commands --------
+cmd_fetch() {
+    msg "fetch: $PKG_ID"
+    if [ -f "$SRCFILE" ]; then
+        msg "source already cached: $SRCFILE"
+        sha256_check "$SRCFILE" "$PKG_SHA256"
+        return 0
+    fi
+    tmp="$XBUILD_TMPDIR/$PKG_ARCHIVE.part"
+    download_file "$PKG_URL" "$tmp" || die "download failed: $PKG_URL"
+    sha256_check "$tmp" "$PKG_SHA256"
+    mv "$tmp" "$SRCFILE" || die "cannot move into cache: $SRCFILE"
+    msg "cached: $SRCFILE"
+}
+
+cmd_build() {
+    cmd_fetch
+    msg "build: $PKG_ID"
+    unpack_source
+    do_build
+    msg "build ok: $PKG_ID"
+    [ "$XBUILD_KEEP_BUILD" = "1" ] || [ "$XBUILD_KEEP_BUILD" = "true" ] || {
+        # keep build dir for install step; do not delete here
+        :
+    }
+}
+
+cmd_install() {
+    cmd_build
+    msg "install (stage + finalize): $PKG_ID"
+    do_stage_install
+    register_and_finalize
+    # Cleanup build dir if requested
+    if [ "$XBUILD_KEEP_BUILD" != "1" ] && [ "$XBUILD_KEEP_BUILD" != "true" ]; then
+        [ "$XBUILD_KEEP_BUILD" = "0" ] && safe_rm_rf "$BUILDD" 2>/dev/null || :
+        safe_rm_rf "$STAGED/destdir" 2>/dev/null || :
     fi
 }
 
+cmd_clean() {
+    msg "clean: $PKG_ID"
+    safe_rm_rf "$BUILDD" 2>/dev/null || :
+    safe_rm_rf "$STAGED" 2>/dev/null || :
+    msg "cleaned: $PKG_ID"
+}
 
-###############################################################################
-# CLI
-###############################################################################
+cmd_list() {
+    if [ ! -d "$XBUILD_DB" ]; then
+        msg "no db directory: $XBUILD_DB"
+        return 0
+    fi
+    found=0
+    for d in "$XBUILD_DB"/*; do
+        [ -d "$d" ] || continue
+        [ -f "$d/meta.txt" ] || continue
+        pkgid=$(basename "$d")
+        ver=$(awk -F= '$1=="version"{print $2}' "$d/meta.txt" 2>/dev/null | awk 'NR==1{print;exit}')
+        ref=$(awk -F= '$1=="ref"{print $2}' "$d/meta.txt" 2>/dev/null | awk 'NR==1{print;exit}')
+        printf '%s\t%s\t%s\n' "$pkgid" "$ver" "$ref"
+        found=1
+    done
+    [ "$found" -eq 1 ] || msg "no packages installed"
+}
 
-usage() {
-    cat >&2 <<EOF
-xbuild $XBUILD_VERSION
-Usage:
-  xbuild fetch <recipe|pkg>       # download + verify distfile (no build)
-  xbuild hash <file>              # print sha256 of a file
-  xbuild hash-recipe <recipe|pkg> # fetch (if needed) and print sha256 of distfile
-  xbuild gen-sha <recipe|pkg|url> # fetch (no hash required) and print sha + recipe lines
-  xbuild build <recipe|pkg>       # build target + deps (cycle-checked), install
-  xbuild remove <pkg>
-  xbuild status [--verbose]    # show installed + owners + collision diagnostics
+cmd_info() {
+    msg "info: $PKG_ID"
+    printf '%s\n' "recipe: $recipe_file"
+    printf '%s\n' "ref:    $PKG_REF"
+    printf '%s\n' "name:   $PKG_NAME"
+    printf '%s\n' "ver:    $PKG_VERSION"
+    printf '%s\n' "url:    $PKG_URL"
+    printf '%s\n' "sha256: $PKG_SHA256"
+    printf '%s\n' "build:  $PKG_BUILD_SYSTEM"
+    [ -n "${PKG_DEPENDS:-}" ] && printf '%s\n' "deps:   $PKG_DEPENDS"
+    if [ -f "$PKG_DB/meta.txt" ]; then
+        printf '\n%s\n' "installed meta:"
+        cat "$PKG_DB/meta.txt"
+    else
+        printf '\n%s\n' "not installed"
+    fi
+}
 
-  xbuild distfiles ls             # list cached distfiles
-  xbuild distfiles prune          # remove partial downloads
+# -------- Arg parsing --------
+CMD=
+PKGARG=
+parse_args() {
+    # extract command
+    [ $# -ge 1 ] || { usage; exit 1; }
+    c=$1; shift
+    case "$c" in
+        fetch|f)   CMD=fetch ;;
+        build|b)   CMD=build ;;
+        install|i) CMD=install ;;
+        remove|r)  CMD=remove ;;
+        list|ls)   CMD=list ;;
+        info|in)   CMD=info ;;
+        clean|cl)  CMD=clean ;;
+        help|h|-h|--help) usage; exit 0 ;;
+        *) die "unknown command: $c (use: xbuild help)" ;;
+    esac
 
-Profiles:
-  XBUILD_PROFILE=host|bootstrap|cross (default: host)
+    # options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -R|--rootfs) shift; [ $# -gt 0 ] || die "missing arg for --rootfs"; XBUILD_ROOTFS=$1 ;;
+            -P|--prefix) shift; [ $# -gt 0 ] || die "missing arg for --prefix"; XBUILD_PREFIX=$1 ;;
+            -r|--recipes) shift; [ $# -gt 0 ] || die "missing arg for --recipes"; XBUILD_RECIPES=$1 ;;
+            -j|--jobs) shift; [ $# -gt 0 ] || die "missing arg for --jobs"; XBUILD_JOBS=$1 ;;
+            -k|--keep-build) XBUILD_KEEP_BUILD=1 ;;
+            -y|--yes) XBUILD_ASSUME_YES=1 ;;
+            -q|--quiet) QUIET=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
+            --) shift; break ;;
+            -*)
+                die "unknown option: $1"
+                ;;
+            *)
+                break
+                ;;
+        esac
+        shift
+    done
 
-Modes:
-  XBUILD_INSTALL_MODE=host|sysroot (default: host)
+    if [ "$CMD" = "list" ]; then
+        return 0
+    fi
 
-Host install safety:
-  To install into '/', you MUST set:
-    XBUILD_ALLOW_HOST_INSTALL=1
-
-Sysroot:
-  XBUILD_INSTALL_MODE=sysroot XBUILD_SYSROOT=/path/to/sysroot
-
-EOF
-    exit 2
+    [ $# -ge 1 ] || die "missing package argument"
+    PKGARG=$1
 }
 
 main() {
-    need awk; need sed; need grep; need find; need mkdir; need rm; need rmdir; need chmod; need cksum; need head; need sort; need ln; need tar
-    load_config
-    apply_profile
-    lock
+    parse_args "$@"
 
-    cmd=${1:-}
-    case "$cmd" in
-        fetch)  [ $# -eq 2 ] || usage; cmd_fetch_recipe "$(resolve_recipe "$2")" ;;
-        hash)  [ $# -eq 2 ] || usage; cmd_hash_file "$2" ;;
-        hash-recipe) [ $# -eq 2 ] || usage; cmd_hash_recipe "$(resolve_recipe "$2")" ;;
-        gen-sha) [ $# -eq 2 ] || usage; cmd_gen_sha "$2" ;;
-        build)
-            [ $# -ge 2 ] || usage
-            shift
-            roots=""
-            for t in "$@"; do
-                roots="$roots $(resolve_recipe "$t")"
-            done
-            # shellcheck disable=SC2086
-            toposort_recipes $roots | while IFS= read -r r; do
-                [ -n "$r" ] || continue
-                id="$(recipe_id "$r")"
-                pkg="${id%%	*}"
-                if pkg_is_installed "$pkg"; then
-                    msg "skipping installed: $pkg"
-                else
-                    build_pkg "$r"
-                fi
-            done
-            ;;
+    lock_acquire
 
-        remove) [ $# -eq 2 ] || usage; remove_pkg "$2" ;;
-        status) [ $# -le 2 ] || usage; cmd_status "${2:-}" ;;
-        distfiles)
-            sub=${2:-}
-            case "$sub" in
-                ls)    [ $# -eq 2 ] || usage; cmd_distfiles_ls ;;
-                prune) [ $# -eq 2 ] || usage; cmd_distfiles_prune_partials ;;
-                *) die "unknown distfiles subcommand: ${sub:-} (expected ls|prune)" ;;
-            esac
+    if [ "$CMD" = "list" ]; then
+        mkp "$XBUILD_DB"
+        cmd_list
+        return 0
+    fi
+
+    recipe_file=$(recipe_find "$PKGARG")
+    recipe_load "$recipe_file"
+    paths_init
+
+    # stricter sanity checks
+    if [ "$XBUILD_STRICT" = "1" ]; then
+        is_abs "$XBUILD_PREFIX" || die "prefix must be absolute (e.g. /usr): $XBUILD_PREFIX"
+        is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
+        [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
+    fi
+
+    case "$CMD" in
+        fetch)   cmd_fetch ;;
+        build)   cmd_build ;;
+        install) cmd_install ;;
+        clean)   cmd_clean ;;
+        info)    cmd_info ;;
+        remove)
+            # allow remove by pkgid (name-version) as well as recipe reference.
+            if pkg_installed "$PKGARG"; then
+                do_remove "$PKGARG"
+            else
+                do_remove "$PKG_ID"
+            fi
             ;;
-        ""|-h|--help|help) usage ;;
-        *) die "unknown command: $cmd" ;;
     esac
 }
 
