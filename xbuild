@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.5"
+# XBUILD_VERSION="0.0.6"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Defaults (override via environment) --------
@@ -220,6 +220,14 @@ run_strict() {
     return $rc
 }
 
+# Quote seguro para uso em comandos passados via su -c (single-quote style)
+sh_quote() {
+    # Produz uma string single-quoted, escapando aspas simples internas.
+    # Ex: abc'd -> 'abc'\''d'
+    s=$1
+    printf "'%s'" "$(printf '%s' "$s" | sed "s/'/'\\\\''/g")"
+}
+
 should_drop_privs() {
     # Returns 0 if we should run build commands as unprivileged user (when running as root)
     [ "${XBUILD_UNPRIVILEGED_BUILD:-0}" = "1" ] || return 1
@@ -240,36 +248,44 @@ assert_build_user_available() {
     fi
 }
 
-           run_build_logged() {
-               # run_build_logged <dir> <shell-snippet>
-               dir=$1; shift
-               # Expect a single snippet argument from callers; preserve exact string.
-               snippet=$1
+run_build_logged() {
+    # run_build_logged <dir> <shell-snippet>
+    dir=$1; shift
+    # Espera um único argumento (snippet) vindo dos callers.
+    snippet=$1
 
-               script="$XBUILD_TMPDIR/snippet.$$.$RANDOM.sh"
-               : >"$script" || die "cannot write temp script"
-               chmod 700 "$script" 2>/dev/null || :
-               {
-                   printf '%s
-' '#!/bin/sh'
-                   printf '%s
-' "$snippet"
-               } >"$script" || die "cannot write temp script"
-               chmod 700 "$script" 2>/dev/null || :
+    # Criar script temporário de forma portátil:
+    if command -v mktemp >/dev/null 2>&1; then
+        script=$(mktemp "$XBUILD_TMPDIR/snippet.XXXXXX.sh") || die "cannot create temp script"
+    else
+        # Fallback POSIX: PID + timestamp
+        ts=$(date '+%s' 2>/dev/null || echo $$)
+        script="$XBUILD_TMPDIR/snippet.$$.$ts.sh"
+        : >"$script" || die "cannot write temp script"
+    fi
 
-               if should_drop_privs; then
-                   escdir=$(printf '%s' "$dir" | sed 's/"/\"/g')
-                   escscript=$(printf '%s' "$script" | sed 's/"/\"/g')
-                   run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "cd "$escdir" && sh "$escscript""
-                   rc=$?
-               else
-                   (cd "$dir" && run_strict sh "$script")
-                   rc=$?
-               fi
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf '%s\n' "$snippet"
+    } >"$script" || die "cannot write temp script"
 
-               rm -f -- "$script" 2>/dev/null || rm -f "$script" 2>/dev/null || :
-               return $rc
-           }
+    # Se for executar como usuário não-root, o script precisa ser legível/executável por ele.
+    if should_drop_privs; then
+        chown "$XBUILD_BUILD_USER" "$script" 2>/dev/null || die "cannot chown temp script to build user"
+        chmod 700 "$script" 2>/dev/null || :
+        cmd="cd $(sh_quote "$dir") && sh $(sh_quote "$script")"
+        run_strict su -s /bin/sh "$XBUILD_BUILD_USER" -c "$cmd"
+        rc=$?
+    else
+        chmod 700 "$script" 2>/dev/null || :
+        (cd "$dir" && run_strict sh "$script")
+        rc=$?
+    fi
+
+    rm -f -- "$script" 2>/dev/null || rm -f "$script" 2>/dev/null || :
+    return $rc
+}
+
 
 
 
@@ -320,11 +336,9 @@ sha256_check() {
                matches=$(find "$XBUILD_RECIPES" -mindepth 2 -maxdepth 2 -type f -name "$name.sh" -print 2>/dev/null | LC_ALL=C sort)
                [ -n "$matches" ] || die "recipe not found by name: $name"
 
-               count=$(printf '%s
-' "$matches" | awk 'NF{c++} END{print c+0}')
+               count=$(printf '%s\n' "$matches" | awk 'NF{c++} END{print c+0}')
                [ "$count" -eq 1 ] || die "ambiguous recipe name: $name (use category/name)"
-               printf '%s
-' "$matches" | awk 'NF{print; exit}'
+               printf '%s\n' "$matches" | awk 'NF{print; exit}'
            }
 
            recipe_load() {
@@ -559,6 +573,8 @@ manifest_write() {
 collision_check() {
     [ "$XBUILD_FORCE" = "1" ] && return 0
     [ -d "$XBUILD_DB" ] || return 0
+
+    need_cmd comm
 
     newmf="$MANIFEST"
     [ -f "$newmf" ] || die "internal: missing new manifest"
