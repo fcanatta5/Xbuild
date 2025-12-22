@@ -1,12 +1,11 @@
 #!/bin/sh
- 
+# XBUILD_VERSION="0.0.1"
 # License: MIT-0 (do whatever you want, no warranty).
-# XBUILD_VERSION="0.0.0"
 
 # -------- Defaults (override via environment) --------
 : "${XBUILD_PREFIX:=/usr}"
 : "${XBUILD_ROOTFS:=/}"                 # final root ("/" for live system, or a rootfs dir)
-: "${XBUILD_RECIPES:=/var/xbuild/repo/packages}"
+: "${XBUILD_RECIPES:=/etc/xbuild/recipes}"
 : "${XBUILD_WORK:=/var/lib/xbuild}"
 : "${XBUILD_CACHE:=$XBUILD_WORK/cache}"
 : "${XBUILD_SOURCES:=$XBUILD_CACHE/sources}"
@@ -20,10 +19,11 @@
 : "${XBUILD_VERIFY_TLS:=1}"            # 0 passes -k to curl (not recommended)
 : "${XBUILD_ASSUME_YES:=0}"            # 1 skips prompts for destructive actions
 : "${XBUILD_STRICT:=1}"                # 1 enables stricter checks
+: "${XBUILD_FORCE:=0}"                 # 1 allows file collisions with installed packages
 
-# -------- Helpers --------
 umask "$XBUILD_UMASK" 2>/dev/null || :
 
+# -------- Helpers --------
 die() { printf '%s\n' "xbuild: ERROR: $*" >&2; exit 1; }
 warn(){ printf '%s\n' "xbuild: WARN:  $*" >&2; }
 msg() { printf '%s\n' "xbuild: $*"; }
@@ -32,7 +32,6 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 
 is_abs() { case "$1" in /*) return 0;; *) return 1;; esac; }
 
-# portable readlink replacement is messy; avoid it. Use physical paths where possible.
 mkp() { mkdir -p "$1" || die "cannot create directory: $1"; }
 
 now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date; }
@@ -51,12 +50,29 @@ confirm() {
     case "$ans" in y|Y|yes|YES) return 0;; *) return 1;; esac
 }
 
-# lock via mkdir (atomic on POSIX)
+# -------- Locking (stale-lock aware) --------
 LOCKDIR=
 lock_acquire() {
     LOCKDIR="$XBUILD_WORK/.lock"
+    mkp "$XBUILD_WORK"
     i=0
     while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        # stale lock recovery
+        if [ -f "$LOCKDIR/pid" ]; then
+            lpid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+            case "$lpid" in
+                ''|*[!0-9]*) : ;;
+                *)
+                    if kill -0 "$lpid" 2>/dev/null; then
+                        : # still running
+                    else
+                        warn "stale lock detected (pid=$lpid); recovering"
+                        safe_rm_rf "$LOCKDIR"
+                        continue
+                    fi
+                    ;;
+            esac
+        fi
         i=$((i+1))
         [ "$i" -le 120 ] || die "lock timeout (another xbuild running?)"
         sleep 1
@@ -65,18 +81,22 @@ lock_acquire() {
 }
 lock_release() {
     [ -n "${LOCKDIR:-}" ] || return 0
-    safe_rm_rf "$LOCKDIR"
+    safe_rm_rf "$LOCKDIR" 2>/dev/null || :
     LOCKDIR=
 }
 
-cleanup() {
-    st=$?
-    # best effort cleanup of temp dir
-    [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ] && safe_rm_rf "$XBUILD_TMPDIR"
+# -------- Cleanup / traps (avoid exit recursion) --------
+XBUILD_TMPDIR=
+cleanup_common() {
+    [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ] && safe_rm_rf "$XBUILD_TMPDIR" 2>/dev/null || :
     lock_release
-    exit "$st"
 }
-trap cleanup INT TERM HUP EXIT
+
+on_exit() { cleanup_common; }
+on_signal() { st=$?; cleanup_common; exit "${st:-1}"; }
+
+trap on_signal INT TERM HUP
+trap on_exit EXIT
 
 # -------- Usage --------
 usage() {
@@ -86,18 +106,19 @@ xbuild - minimal source fetch/build/install manager
 USAGE:
   xbuild <cmd> [options] <pkg>
   xbuild <cmd> [options] <category/pkg>
+  xbuild remove|r [options] <pkgid>   (e.g., zlib-1.3.1)
 
 COMMANDS (and abbreviations):
   fetch      (f)     Download source tarball + verify SHA256 + store in cache
   build      (b)     Unpack + build in isolated build dir
   install    (i)     Stage install into DESTDIR + register + then copy into ROOTFS
-  remove     (r)     Uninstall registered files from ROOTFS
+  remove     (r)     Uninstall registered files from ROOTFS (by pkgid or by recipe ref)
   list       (ls)    List installed packages
   info       (in)    Show recipe + installed metadata
   clean      (cl)    Remove build/staging dirs for a package (keeps sources)
   help       (h)     Show help
 
-OPTIONS (apply to fetch/build/install/remove/info/clean where relevant):
+OPTIONS:
   -R, --rootfs PATH       Final root (default: /)
   -P, --prefix PATH       Prefix inside ROOTFS (default: /usr)
   -r, --recipes PATH      Recipes directory (default: /etc/xbuild/recipes)
@@ -110,57 +131,49 @@ OPTIONS (apply to fetch/build/install/remove/info/clean where relevant):
 ENV overrides:
   XBUILD_ROOTFS XBUILD_PREFIX XBUILD_RECIPES XBUILD_WORK XBUILD_CACHE XBUILD_SOURCES
   XBUILD_BUILDDIR XBUILD_STAGING XBUILD_DB XBUILD_LOGS XBUILD_JOBS XBUILD_KEEP_BUILD
-  XBUILD_ASSUME_YES XBUILD_STRICT
+  XBUILD_ASSUME_YES XBUILD_STRICT XBUILD_FORCE
 
 RECIPE FORMAT:
-  Put a recipe file at:
-    $XBUILD_RECIPES/<category>/<name>.sh
+  $XBUILD_RECIPES/<category>/<name>.sh
 
-  Required variables:
-    PKG_NAME, PKG_VERSION, PKG_URL, PKG_SHA256
-  Optional variables:
-    PKG_ARCHIVE   (filename; default derived from URL)
-    PKG_DIRNAME   (dir inside archive; default derived)
-    PKG_SITE      (homepage/info)
-    PKG_LICENSE
-    PKG_DEPENDS   (space-separated)
-    PKG_BUILD_SYSTEM: autotools|cmake|meson|make|custom (default: autotools)
-    PKG_CONFIGURE_OPTS
-    PKG_MAKE_OPTS
-    PKG_INSTALL_OPTS
-    PKG_PATCHES   (space-separated patch file paths)
-    PKG_ENV       (extra VAR=VAL pairs exported during build/install)
-    PKG_PRE_BUILD, PKG_POST_BUILD (shell snippets; careful)
-    PKG_PRE_INSTALL, PKG_POST_INSTALL
+Required variables:
+  PKG_NAME, PKG_VERSION, PKG_URL, PKG_SHA256
 
-EXAMPLES:
+Optional variables:
+  PKG_ARCHIVE   (filename; default derived from URL)
+  PKG_DIRNAME   (dir inside archive; default derived)
+  PKG_SITE      (homepage/info)
+  PKG_LICENSE
+  PKG_DEPENDS   (space-separated)
+  PKG_BUILD_SYSTEM: autotools|cmake|meson|make|custom (default: autotools)
+  PKG_CONFIGURE_OPTS
+  PKG_MAKE_OPTS
+  PKG_INSTALL_OPTS
+  PKG_PATCHES   (space-separated patch file paths)
+  PKG_ENV       (extra VAR=VAL pairs exported during build/install)
+  PKG_PRE_BUILD, PKG_POST_BUILD (shell snippets)
+  PKG_PRE_INSTALL, PKG_POST_INSTALL
+  PKG_CUSTOM_BUILD, PKG_CUSTOM_INSTALL
+
+Examples:
   xbuild fetch busybox
   xbuild b base/busybox
   xbuild i base/busybox -R /mnt/rootfs
+  xbuild r busybox-1.36.1 -R /mnt/rootfs
 EOF
 }
 
-# -------- Logging --------
+# -------- Logging / command execution --------
 QUIET=0
 VERBOSE=0
 logfile=
-run() {
-    # run <cmd...> : logs stdout+stderr
-    if [ "$QUIET" -eq 1 ]; then
-        "$@" >>"$logfile" 2>&1 || return $?
-    else
-        "$@" 2>&1 | tee -a "$logfile" >/dev/null || return ${PIPESTATUS:-1}
-    fi
-    return 0
-}
 
-# POSIX sh does not have PIPESTATUS; emulate by avoiding tee in strict mode
 run_strict() {
+    # logs to $logfile and also prints to stderr (unless quiet), preserving exit status
     if [ "$QUIET" -eq 1 ]; then
         "$@" >>"$logfile" 2>&1
         return $?
     fi
-    # Use a temp file and then cat to terminal to keep correct exit status.
     tf="$XBUILD_TMPDIR/cmd.out"
     : >"$tf" || die "cannot write temp output"
     "$@" >>"$tf" 2>&1
@@ -187,7 +200,6 @@ download_file() {
             run_strict curl $tlsflag -L --fail --retry 3 --retry-delay 2 -o "$out" "$url"
             ;;
         wget)
-            # wget validates TLS by default (unless configured otherwise)
             run_strict wget -O "$out" "$url"
             ;;
     esac
@@ -212,8 +224,6 @@ recipe_find() {
         [ -f "$f" ] && { echo "$f"; return 0; }
         die "recipe not found: $arg (expected $f)"
     fi
-    # search by name
-    # shellcheck disable=SC2012
     f=$(ls -1 "$XBUILD_RECIPES"/*/"$name".sh 2>/dev/null | awk 'NR==1{print;exit}')
     [ -n "$f" ] && [ -f "$f" ] && { echo "$f"; return 0; }
     die "recipe not found by name: $name"
@@ -221,12 +231,12 @@ recipe_find() {
 
 recipe_load() {
     recipe_file=$1
-    # Reset variables to avoid leakage between runs
     PKG_NAME= PKG_VERSION= PKG_URL= PKG_SHA256=
     PKG_ARCHIVE= PKG_DIRNAME= PKG_SITE= PKG_LICENSE=
     PKG_DEPENDS= PKG_BUILD_SYSTEM= PKG_CONFIGURE_OPTS=
     PKG_MAKE_OPTS= PKG_INSTALL_OPTS= PKG_PATCHES=
     PKG_ENV= PKG_PRE_BUILD= PKG_POST_BUILD= PKG_PRE_INSTALL= PKG_POST_INSTALL=
+    PKG_CUSTOM_BUILD= PKG_CUSTOM_INSTALL=
     # shellcheck disable=SC1090
     . "$recipe_file" || die "failed to source recipe: $recipe_file"
     [ -n "$PKG_NAME" ] || die "recipe missing PKG_NAME ($recipe_file)"
@@ -239,7 +249,6 @@ recipe_load() {
         [ -n "$PKG_ARCHIVE" ] || die "cannot derive PKG_ARCHIVE from URL"
     fi
     if [ -z "$PKG_DIRNAME" ]; then
-        # heuristics: strip common archive suffixes
         d=$PKG_ARCHIVE
         for suf in .tar.gz .tgz .tar.xz .tar.bz2 .tbz2 .tar.zst .zip; do
             case "$d" in *"$suf") d=${d%"$suf"};; esac
@@ -285,7 +294,6 @@ unpack_source() {
     esac
     SRCDIR="$BUILDD/$PKG_DIRNAME"
     [ -d "$SRCDIR" ] || {
-        # try single top-level directory detection
         d=$(find "$BUILDD" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | awk 'NR==1{print;exit}')
         [ -n "$d" ] && SRCDIR="$d"
         [ -d "$SRCDIR" ] || die "source dir not found after unpack (expected $BUILDD/$PKG_DIRNAME)"
@@ -302,15 +310,11 @@ unpack_source() {
 
 # -------- Build / Install logic --------
 export_env() {
-    # Common env; allow recipes to add PKG_ENV
-    # NOTE: do not export CC/CFLAGS by default; user can set in environment or recipe.
     export PREFIX="$XBUILD_PREFIX"
     export DESTDIR="$STAGED/destdir"
     export MAKEFLAGS="-j$XBUILD_JOBS"
-    # extra environment pairs
     if [ -n "${PKG_ENV:-}" ]; then
         for kv in $PKG_ENV; do
-            # kv must be VAR=VAL
             case "$kv" in *=*) export "$kv" ;; *) die "invalid PKG_ENV token (need VAR=VAL): $kv" ;; esac
         done
     fi
@@ -318,7 +322,6 @@ export_env() {
 
 do_build() {
     export_env
-    # shell snippets (advanced; keep optional)
     [ -n "${PKG_PRE_BUILD:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_PRE_BUILD") || :
     case "$PKG_BUILD_SYSTEM" in
         autotools)
@@ -362,14 +365,11 @@ do_stage_install() {
             (cd "$SRCDIR" && run_strict make DESTDIR="$DESTDIR" install $PKG_INSTALL_OPTS) || die "install failed"
             ;;
         cmake)
-            (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --install . --prefix "$XBUILD_PREFIX" --strip $PKG_INSTALL_OPTS --) || {
-                # older cmake may not support --strip/--prefix as used; fallback
-                (cd "$SRCDIR/.xbuild-cmake" && run_strict cmake --install . --prefix "$XBUILD_PREFIX") || die "cmake install failed"
-            }
-            # cmake installs to DESTDIR if env is set
+            # CMake honors DESTDIR env; avoid unsupported flags for portability.
+            (cd "$SRCDIR/.xbuild-cmake" && DESTDIR="$DESTDIR" run_strict cmake --install . --prefix "$XBUILD_PREFIX" $PKG_INSTALL_OPTS) || die "cmake install failed"
             ;;
         meson)
-            (cd "$SRCDIR/.xbuild-meson" && run_strict ninja install) || die "meson install failed"
+            (cd "$SRCDIR/.xbuild-meson" && DESTDIR="$DESTDIR" run_strict ninja install) || die "meson install failed"
             ;;
         custom)
             [ -n "${PKG_CUSTOM_INSTALL:-}" ] || die "PKG_BUILD_SYSTEM=custom requires PKG_CUSTOM_INSTALL"
@@ -384,8 +384,11 @@ manifest_write() {
     MANIFEST="$PKG_DB/manifest.txt"
     META="$PKG_DB/meta.txt"
     : >"$MANIFEST" || die "cannot write manifest"
+
     # record files relative to ROOTFS, excluding directories
-    (cd "$DESTDIR" && find . -type f -o -type l) | sed 's|^\./||' | sort >"$MANIFEST"
+    (cd "$DESTDIR" && find . \( -type f -o -type l \) -print) |
+        sed 's|^\./||' | sort >"$MANIFEST"
+
     {
         echo "pkg_id=$PKG_ID"
         echo "name=$PKG_NAME"
@@ -400,20 +403,54 @@ manifest_write() {
     } >"$META"
 }
 
+# Detect collisions with installed packages (file ownership)
+collision_check() {
+    [ "$XBUILD_FORCE" = "1" ] && return 0
+    [ -d "$XBUILD_DB" ] || return 0
+
+    newmf="$MANIFEST"
+    [ -f "$newmf" ] || die "internal: missing new manifest"
+    # If nothing installed, skip.
+    ls -1 "$XBUILD_DB"/*/manifest.txt >/dev/null 2>&1 || return 0
+
+    for oldmf in "$XBUILD_DB"/*/manifest.txt; do
+        [ -f "$oldmf" ] || continue
+        oldpkg=$(basename "$(dirname "$oldmf")")
+        [ "$oldpkg" = "$PKG_ID" ] && continue
+        # comm needs sorted input; manifests are sorted.
+        overlap=$(comm -12 "$newmf" "$oldmf" | awk 'NR==1{print;exit}')
+        if [ -n "$overlap" ]; then
+            die "file collision detected with installed package $oldpkg at path: $overlap (set XBUILD_FORCE=1 to override)"
+        fi
+    done
+}
+
+tar_extract_try() {
+    # tar_extract_try <rootdir>
+    root=$1
+    # Try preserving perms first, fallback without -p if tar doesn't support it.
+    if (cd "$root" && tar -xpf -) 2>/dev/null; then
+        return 0
+    fi
+    warn "tar does not support -p or failed; retrying without permission preservation"
+    (cd "$root" && tar -xf -) || return 1
+}
+
 copy_to_rootfs() {
-    # Basic sanity
     is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
     is_abs "$XBUILD_PREFIX" || die "prefix must be absolute: $XBUILD_PREFIX"
     [ -d "$DESTDIR" ] || die "missing DESTDIR: $DESTDIR"
     [ -d "$XBUILD_ROOTFS" ] || die "rootfs not found: $XBUILD_ROOTFS"
 
-    # Install requires write perms; if ROOTFS="/" then typically root.
     if [ "$XBUILD_ROOTFS" = "/" ]; then
         [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] || warn "installing to / usually requires root"
     fi
 
-    # Copy using tar pipeline to preserve permissions and symlinks in a POSIX-ish way
-    (cd "$DESTDIR" && tar -cf - .) | (cd "$XBUILD_ROOTFS" && tar -xpf -) || die "copy into rootfs failed"
+    # Verify collisions before writing into rootfs.
+    collision_check
+
+    # Copy using tar pipeline to preserve permissions and symlinks when possible.
+    (cd "$DESTDIR" && tar -cf - .) | tar_extract_try "$XBUILD_ROOTFS" || die "copy into rootfs failed"
 }
 
 register_and_finalize() {
@@ -425,10 +462,10 @@ register_and_finalize() {
 }
 
 pkg_installed() {
-    [ -f "$XBUILD_DB/$1/meta.txt" ]
+    [ -d "$XBUILD_DB/$1" ] && [ -f "$XBUILD_DB/$1/meta.txt" ]
 }
 
-do_remove() {
+do_remove_pkgid() {
     pkgid=$1
     db="$XBUILD_DB/$pkgid"
     [ -d "$db" ] || die "not installed: $pkgid"
@@ -437,14 +474,13 @@ do_remove() {
     [ -f "$mf" ] || die "missing manifest: $mf"
 
     rootfs="$XBUILD_ROOTFS"
-    # If meta recorded a different rootfs, prefer explicit -R/--rootfs; else warn.
     if [ -f "$meta" ]; then
         rec_rootfs=$(awk -F= '$1=="rootfs"{print $2}' "$meta" 2>/dev/null | awk 'NR==1{print;exit}')
-        [ -n "$rec_rootfs" ] && [ "$rec_rootfs" != "$rootfs" ] && warn "recipe installed with rootfs=$rec_rootfs; removing from rootfs=$rootfs"
+        [ -n "$rec_rootfs" ] && [ "$rec_rootfs" != "$rootfs" ] && warn "package recorded rootfs=$rec_rootfs; removing from rootfs=$rootfs"
     fi
 
     confirm "This will remove files for $pkgid from $rootfs. Continue?" || die "aborted"
-    # Remove files in reverse path length to reduce dir-empty issues; ignore missing files
+
     awk '{print length, $0}' "$mf" | sort -rn | cut -d" " -f2- |
     while IFS= read -r rel; do
         [ -n "$rel" ] || continue
@@ -453,13 +489,16 @@ do_remove() {
             rm -f -- "$f" 2>/dev/null || rm -f "$f" || die "cannot remove: $f"
         fi
     done
-    # Optionally remove empty directories under prefix path, best-effort
-    # shellcheck disable=SC2016
-    (cd "$rootfs" && awk -F/ '{NF--; print}' "$mf" | sed 's|/|/|g' | sort -u |
-        while IFS= read -r d; do
-            [ -n "$d" ] || continue
-            rmdir -- "$d" 2>/dev/null || :
-        done) || :
+
+    # Remove empty directories (best-effort), derived from manifest paths.
+    # Convert each file path to its parent directories, try deepest first.
+    awk -F/ 'NF>1{NF--; OFS="/"; print}' "$mf" | sort -u |
+    awk '{print length, $0}' | sort -rn | cut -d" " -f2- |
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        rmdir -- "$rootfs/$d" 2>/dev/null || :
+    done
+
     safe_rm_rf "$db"
     msg "removed: $pkgid"
 }
@@ -485,10 +524,6 @@ cmd_build() {
     unpack_source
     do_build
     msg "build ok: $PKG_ID"
-    [ "$XBUILD_KEEP_BUILD" = "1" ] || [ "$XBUILD_KEEP_BUILD" = "true" ] || {
-        # keep build dir for install step; do not delete here
-        :
-    }
 }
 
 cmd_install() {
@@ -496,9 +531,8 @@ cmd_install() {
     msg "install (stage + finalize): $PKG_ID"
     do_stage_install
     register_and_finalize
-    # Cleanup build dir if requested
     if [ "$XBUILD_KEEP_BUILD" != "1" ] && [ "$XBUILD_KEEP_BUILD" != "true" ]; then
-        [ "$XBUILD_KEEP_BUILD" = "0" ] && safe_rm_rf "$BUILDD" 2>/dev/null || :
+        safe_rm_rf "$BUILDD" 2>/dev/null || :
         safe_rm_rf "$STAGED/destdir" 2>/dev/null || :
     fi
 }
@@ -550,7 +584,6 @@ cmd_info() {
 CMD=
 PKGARG=
 parse_args() {
-    # extract command
     [ $# -ge 1 ] || { usage; exit 1; }
     c=$1; shift
     case "$c" in
@@ -565,7 +598,6 @@ parse_args() {
         *) die "unknown command: $c (use: xbuild help)" ;;
     esac
 
-    # options
     while [ $# -gt 0 ]; do
         case "$1" in
             -R|--rootfs) shift; [ $# -gt 0 ] || die "missing arg for --rootfs"; XBUILD_ROOTFS=$1 ;;
@@ -598,6 +630,12 @@ parse_args() {
 main() {
     parse_args "$@"
 
+    # strict sanity checks that don't require recipe
+    if [ "$XBUILD_STRICT" = "1" ]; then
+        is_abs "$XBUILD_PREFIX" || die "prefix must be absolute (e.g. /usr): $XBUILD_PREFIX"
+        is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
+    fi
+
     lock_acquire
 
     if [ "$CMD" = "list" ]; then
@@ -606,16 +644,26 @@ main() {
         return 0
     fi
 
+    # Special-case remove: allow removing by pkgid even if recipe is missing.
+    if [ "$CMD" = "remove" ]; then
+        mkp "$XBUILD_DB"
+        if pkg_installed "$PKGARG"; then
+            do_remove_pkgid "$PKGARG"
+            return 0
+        fi
+        # Otherwise interpret argument as recipe ref/name, load recipe to compute PKG_ID.
+        [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
+        recipe_file=$(recipe_find "$PKGARG")
+        recipe_load "$recipe_file"
+        paths_init
+        do_remove_pkgid "$PKG_ID"
+        return 0
+    fi
+
+    [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
     recipe_file=$(recipe_find "$PKGARG")
     recipe_load "$recipe_file"
     paths_init
-
-    # stricter sanity checks
-    if [ "$XBUILD_STRICT" = "1" ]; then
-        is_abs "$XBUILD_PREFIX" || die "prefix must be absolute (e.g. /usr): $XBUILD_PREFIX"
-        is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
-        [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
-    fi
 
     case "$CMD" in
         fetch)   cmd_fetch ;;
@@ -623,14 +671,7 @@ main() {
         install) cmd_install ;;
         clean)   cmd_clean ;;
         info)    cmd_info ;;
-        remove)
-            # allow remove by pkgid (name-version) as well as recipe reference.
-            if pkg_installed "$PKGARG"; then
-                do_remove "$PKGARG"
-            else
-                do_remove "$PKG_ID"
-            fi
-            ;;
+        *) die "internal: unhandled command: $CMD" ;;
     esac
 }
 
