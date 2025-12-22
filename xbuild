@@ -1,5 +1,5 @@
 #!/bin/sh
-# XBUILD_VERSION="0.0.1"
+# XBUILD_VERSION="0.0.2"
 # License: MIT-0 (do whatever you want, no warranty).
 
 # -------- Defaults (override via environment) --------
@@ -39,10 +39,22 @@ now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date; }
 safe_rm_rf() {
     p=$1
     [ -n "$p" ] || die "internal: empty path in rm"
-    [ "$p" != "/" ] || die "refusing to remove /"
+    case "$p" in
+        /) die "refusing to remove /" ;;
+        .|..) die "refusing to remove relative dot path: $p" ;;
+    esac
+    # Require absolute paths to reduce blast radius when running as root.
+    is_abs "$p" || die "refusing to remove non-absolute path: $p"
+
+    # Never allow removing key xbuild roots (defensive belt-and-suspenders).
+    case "$p" in
+        "$XBUILD_WORK"|"$XBUILD_CACHE"|"$XBUILD_SOURCES"|"$XBUILD_BUILDDIR"|"$XBUILD_STAGING"|"$XBUILD_DB"|"$XBUILD_LOGS")
+            die "refusing to remove xbuild root directory: $p"
+            ;;
+    esac
+
     rm -rf -- "$p" 2>/dev/null || rm -rf "$p" || die "cannot remove: $p"
 }
-
 confirm() {
     [ "$XBUILD_ASSUME_YES" = "1" ] && return 0
     printf '%s' "xbuild: $1 [y/N] " >&2
@@ -73,6 +85,17 @@ lock_acquire() {
                     ;;
             esac
         fi
+        # If lock exists but pid file is missing/unreadable, treat as stale after a short grace period.
+        if [ ! -f "$LOCKDIR/pid" ]; then
+            i=$((i+1))
+            if [ "$i" -ge 3 ]; then
+                warn "lock dir exists without pid; recovering"
+                safe_rm_rf "$LOCKDIR"
+                continue
+            fi
+            sleep 1
+            continue
+        fi
         i=$((i+1))
         [ "$i" -le 120 ] || die "lock timeout (another xbuild running?)"
         sleep 1
@@ -93,9 +116,20 @@ cleanup_common() {
 }
 
 on_exit() { cleanup_common; }
-on_signal() { st=$?; cleanup_common; exit "${st:-1}"; }
+on_signal() {
+    sig=$1
+    cleanup_common
+    case "$sig" in
+        INT)  exit 130 ;;  # 128 + 2
+        HUP)  exit 129 ;;  # 128 + 1
+        TERM) exit 143 ;;  # 128 + 15
+        *)    exit 1 ;;
+    esac
+}
 
-trap on_signal INT TERM HUP
+trap 'on_signal INT'  INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP'  HUP
 trap on_exit EXIT
 
 # -------- Usage --------
@@ -238,6 +272,19 @@ recipe_load() {
     PKG_ENV= PKG_PRE_BUILD= PKG_POST_BUILD= PKG_PRE_INSTALL= PKG_POST_INSTALL=
     PKG_CUSTOM_BUILD= PKG_CUSTOM_INSTALL=
     # shellcheck disable=SC1090
+    if [ "$XBUILD_STRICT" = "1" ]; then
+        # Running as root: refuse recipes/dirs writable by group/others (basic supply-chain hardening).
+        if [ -L "$recipe_file" ]; then
+            die "refusing to load symlink recipe: $recipe_file"
+        fi
+        if LC_ALL=C ls -ld "$XBUILD_RECIPES" 2>/dev/null | awk '{p=$1; if (substr(p,6,1)=="w" || substr(p,9,1)=="w") exit 0; exit 1}' >/dev/null 2>&1; then
+            die "insecure recipes directory permissions (writable by group/others): $XBUILD_RECIPES"
+        fi
+        if LC_ALL=C ls -ld "$recipe_file" 2>/dev/null | awk '{p=$1; if (substr(p,6,1)=="w" || substr(p,9,1)=="w") exit 0; exit 1}' >/dev/null 2>&1; then
+            die "insecure recipe file permissions (writable by group/others): $recipe_file"
+        fi
+    fi
+
     . "$recipe_file" || die "failed to source recipe: $recipe_file"
     [ -n "$PKG_NAME" ] || die "recipe missing PKG_NAME ($recipe_file)"
     [ -n "$PKG_VERSION" ] || die "recipe missing PKG_VERSION ($recipe_file)"
@@ -322,7 +369,9 @@ export_env() {
 
 do_build() {
     export_env
-    [ -n "${PKG_PRE_BUILD:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_PRE_BUILD") || :
+    if [ -n "${PKG_PRE_BUILD:-}" ]; then
+        (cd "$SRCDIR" && sh -c "$PKG_PRE_BUILD") || die "PKG_PRE_BUILD failed"
+    fi
     case "$PKG_BUILD_SYSTEM" in
         autotools)
             [ -x "$SRCDIR/configure" ] || die "configure not found (set PKG_BUILD_SYSTEM or PKG_DIRNAME): $SRCDIR"
@@ -352,14 +401,18 @@ do_build() {
             die "unknown PKG_BUILD_SYSTEM: $PKG_BUILD_SYSTEM"
             ;;
     esac
-    [ -n "${PKG_POST_BUILD:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_POST_BUILD") || :
+    if [ -n "${PKG_POST_BUILD:-}" ]; then
+        (cd "$SRCDIR" && sh -c "$PKG_POST_BUILD") || die "PKG_POST_BUILD failed"
+    fi
 }
 
 do_stage_install() {
     export_env
     safe_rm_rf "$DESTDIR" 2>/dev/null || :
     mkp "$DESTDIR"
-    [ -n "${PKG_PRE_INSTALL:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_PRE_INSTALL") || :
+    if [ -n "${PKG_PRE_INSTALL:-}" ]; then
+        (cd "$SRCDIR" && sh -c "$PKG_PRE_INSTALL") || die "PKG_PRE_INSTALL failed"
+    fi
     case "$PKG_BUILD_SYSTEM" in
         autotools|make)
             (cd "$SRCDIR" && run_strict make DESTDIR="$DESTDIR" install $PKG_INSTALL_OPTS) || die "install failed"
@@ -376,7 +429,9 @@ do_stage_install() {
             (cd "$SRCDIR" && sh -c "$PKG_CUSTOM_INSTALL") || die "custom install failed"
             ;;
     esac
-    [ -n "${PKG_POST_INSTALL:-}" ] && (cd "$SRCDIR" && sh -c "$PKG_POST_INSTALL") || :
+    if [ -n "${PKG_POST_INSTALL:-}" ]; then
+        (cd "$SRCDIR" && sh -c "$PKG_POST_INSTALL") || die "PKG_POST_INSTALL failed"
+    fi
 }
 
 manifest_write() {
