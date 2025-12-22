@@ -1,0 +1,15 @@
+XBUILD_ROOT="/mnt/xbuild/root"
+XBUILD_SYSROOT="/mnt/xbuild/rootfs"
+XBUILD_PREFIX="/usr"
+XBUILD_MAKEJ="4"
+
+# Toolchain de bootstrap musl (prefix fora do rootfs)
+XBUILD_CC="/mnt/xbuild/toolchain/bin/x86_64-linux-musl-gcc"
+XBUILD_CXX="/mnt/xbuild/toolchain/bin/x86_64-linux-musl-g++"
+XBUILD_AR="/mnt/xbuild/toolchain/bin/x86_64-linux-musl-ar"
+XBUILD_RANLIB="/mnt/xbuild/toolchain/bin/x86_64-linux-musl-ranlib"
+XBUILD_STRIP="/mnt/xbuild/toolchain/bin/x86_64-linux-musl-strip"
+
+XBUILD_CFLAGS="-O2 -pipe"
+XBUILD_CXXFLAGS="-O2 -pipe"
+XBUILD_LDFLAGS=""
