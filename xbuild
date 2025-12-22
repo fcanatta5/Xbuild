@@ -11,7 +11,7 @@ set -eu
 # - sha256sum OR shasum OR openssl for SHA-256 verification
 ###############################################################################
 
-XBUILD_VERSION="0.0.1-fetch"
+XBUILD_VERSION="0.0.1"
 
 ###############################################################################
 # Configuration 
@@ -24,7 +24,9 @@ XBUILD_VERSION="0.0.1-fetch"
 : "${XBUILD_LOCKDIR:=$XBUILD_ROOT/.xbuild.lock}"
 
 : "${XBUILD_DISTFILES:=$XBUILD_ROOT/distfiles}"
+: "${XBUILD_RECIPES_DIR:=$XBUILD_ROOT/recipes}"
 
+: "${XBUILD_PROFILE:=host}"          # host | bootstrap | cross
 : "${XBUILD_INSTALL_MODE:=host}"    # host | sysroot
 : "${XBUILD_TARGET_ROOT:=/}"        # used in host mode; must be "/" unless you know what you're doing
 : "${XBUILD_ALLOW_HOST_INSTALL:=0}" # must be 1 to install into "/"
@@ -71,6 +73,35 @@ load_config() {
     # shellcheck disable=SC1090
     . "$XBUILD_CONFIG"
 }
+
+###############################################################################
+# Profiles (host / bootstrap / cross)
+###############################################################################
+
+apply_profile() {
+    # Profiles set defaults; explicit env overrides still win if set after profile.
+    case "$XBUILD_PROFILE" in
+        host)
+            : "${XBUILD_INSTALL_MODE:=host}"
+            : "${XBUILD_STRICT_SYSROOT:=0}"
+            ;;
+        bootstrap)
+            # Bootstrap into an isolated sysroot by default.
+            : "${XBUILD_INSTALL_MODE:=sysroot}"
+            : "${XBUILD_SYSROOT:=$XBUILD_ROOT/bootstrap-sysroot}"
+            : "${XBUILD_STRICT_SYSROOT:=1}"
+            ;;
+        cross)
+            # Cross: install into sysroot (must be set or default), enable strict sysroot plumbing.
+            : "${XBUILD_INSTALL_MODE:=sysroot}"
+            : "${XBUILD_STRICT_SYSROOT:=1}"
+            ;;
+        *)
+            die "invalid XBUILD_PROFILE: $XBUILD_PROFILE (expected host|bootstrap|cross)"
+            ;;
+    esac
+}
+
 
 ###############################################################################
 # Locking (robust enough: PID + timestamp + host)
@@ -158,6 +189,26 @@ sha256_file() {
         *) die "unexpected sha256 tool: $tool" ;;
     esac
 }
+
+cmd_hash_file() {
+    [ $# -eq 1 ] || die "usage: xbuild hash <file>"
+    f=$1
+    [ -f "$f" ] || die "file not found: $f"
+    sha256_file "$f"
+}
+
+cmd_hash_recipe() {
+    [ $# -eq 1 ] || die "usage: xbuild hash-recipe <recipe>"
+    recipe=$1
+    [ -f "$recipe" ] || die "recipe not found: $recipe"
+    # shellcheck disable=SC1090
+    . "$recipe"
+    : "${PKGNAME:?recipe missing PKGNAME}"
+    : "${VERSION:?recipe missing VERSION}"
+    dist=$(fetch_distfile)
+    sha256_file "$dist"
+}
+
 
 verify_sha256() {
     f=$1 want=$2
@@ -551,6 +602,104 @@ remove_pkg() {
 }
 
 ###############################################################################
+# Dependency graph (simple, no version solving; cycle detection)
+#
+# Recipe metadata:
+#   DEPENDS="pkg1 pkg2"            # package names resolved via XBUILD_RECIPES_DIR/<pkg>.recipe
+#   DEPENDS_RECIPES="path1 path2"  # explicit recipe paths (optional)
+###############################################################################
+
+is_recipe_path() {
+    case "$1" in
+        */*|*.recipe) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_recipe() {
+    tok=$1
+    if is_recipe_path "$tok"; then
+        [ -f "$tok" ] || die "dependency recipe not found: $tok"
+        printf '%s\n' "$tok"
+        return 0
+    fi
+    # package name -> recipes dir
+    p="$XBUILD_RECIPES_DIR/$tok.recipe"
+    [ -f "$p" ] || die "dependency recipe for '$tok' not found at: $p"
+    printf '%s\n' "$p"
+}
+
+# Read recipe and print: "<pkgname>\t<recipepath>"
+recipe_id() {
+    r=$1
+    [ -f "$r" ] || die "recipe not found: $r"
+    # Source in a subshell to avoid leaking vars into caller.
+    (
+        # shellcheck disable=SC1090
+        . "$r"
+        : "${PKGNAME:?recipe missing PKGNAME}"
+        printf '%s\t%s\n' "$PKGNAME" "$r"
+    )
+}
+
+# List dependency recipe paths (one per line) for a given recipe path.
+recipe_deps() {
+    r=$1
+    (
+        # shellcheck disable=SC1090
+        . "$r"
+        # DEPENDS_RECIPES may contain recipe paths; DEPENDS contains package names.
+        for t in ${DEPENDS_RECIPES:-}; do
+            resolve_recipe "$t"
+        done
+        for p in ${DEPENDS:-}; do
+            resolve_recipe "$p"
+        done
+    )
+}
+
+# Topological sort with cycle detection (DFS).
+# Output: recipe paths in build order (deps first).
+toposort_recipes() {
+    root_recipe=$1
+
+    state="$XBUILD_WORK/.depstate.$$"
+    mkdirp "$state/tmp" "$state/perm" "$state/map"
+    order="$state/order"
+    : >"$order"
+
+    visit() {
+        rpath=$1
+        # Determine pkgname for key
+        id="$(recipe_id "$rpath")"
+        pkg="${id%%	*}"  # up to tab
+        # Mark checks
+        if [ -f "$state/perm/$pkg" ]; then
+            return 0
+        fi
+        if [ -f "$state/tmp/$pkg" ]; then
+            die "dependency cycle detected at package: $pkg (recipe $rpath)"
+        fi
+        : >"$state/tmp/$pkg"
+        printf '%s\n' "$rpath" >"$state/map/$pkg"
+
+        # Visit dependencies
+        recipe_deps "$rpath" | while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            visit "$dep"
+        done
+
+        rm -f "$state/tmp/$pkg"
+        : >"$state/perm/$pkg"
+        printf '%s\n' "$rpath" >>"$order"
+    }
+
+    visit "$root_recipe"
+    cat "$order"
+}
+
+
+###############################################################################
 # Build orchestration
 ###############################################################################
 
@@ -644,12 +793,17 @@ usage() {
     cat >&2 <<EOF
 xbuild $XBUILD_VERSION
 Usage:
-  xbuild fetch <recipe>          # download + verify distfile (no build)
-  xbuild build <recipe>          # fetch (if needed), verify, build, install
+  xbuild fetch <recipe|pkg>       # download + verify distfile (no build)
+  xbuild hash <file>              # print sha256 of a file
+  xbuild hash-recipe <recipe|pkg> # fetch (if needed) and print sha256 of distfile
+  xbuild build <recipe|pkg>       # build target + deps (cycle-checked), install
   xbuild remove <pkg>
 
-  xbuild distfiles ls            # list cached distfiles
-  xbuild distfiles prune         # remove partial downloads
+  xbuild distfiles ls             # list cached distfiles
+  xbuild distfiles prune          # remove partial downloads
+
+Profiles:
+  XBUILD_PROFILE=host|bootstrap|cross (default: host)
 
 Modes:
   XBUILD_INSTALL_MODE=host|sysroot (default: host)
@@ -666,14 +820,24 @@ EOF
 }
 
 main() {
-    need awk; need sed; need grep; need find; need mkdir; need rm; need rmdir; need chmod; need cksum; need head
+    need awk; need sed; need grep; need find; need mkdir; need rm; need rmdir; need chmod; need cksum; need head; need sort; need ln
     load_config
+    apply_profile
     lock
 
     cmd=${1:-}
     case "$cmd" in
-        fetch)  [ $# -eq 2 ] || usage; cmd_fetch_recipe "$2" ;;
-        build)  [ $# -eq 2 ] || usage; build_pkg "$2" ;;
+        fetch)  [ $# -eq 2 ] || usage; cmd_fetch_recipe "$(resolve_recipe "$2")" ;;
+        hash)  [ $# -eq 2 ] || usage; cmd_hash_file "$2" ;;
+        hash-recipe) [ $# -eq 2 ] || usage; cmd_hash_recipe "$(resolve_recipe "$2")" ;;
+        build)  [ $# -eq 2 ] || usage; 
+            root_recipe=$(resolve_recipe "$2"); 
+            toposort_recipes "$root_recipe" | while IFS= read -r r; do 
+                [ -n "$r" ] || continue; 
+                # Skip already-installed packages
+                pkg="$(recipe_id "$r")"; pkg="${pkg%%	*}"; 
+                if pkg_is_installed "$pkg"; then msg "skipping installed: $pkg"; else build_pkg "$r"; fi; 
+            done ;;
         remove) [ $# -eq 2 ] || usage; remove_pkg "$2" ;;
         distfiles)
             sub=${2:-}
