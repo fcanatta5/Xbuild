@@ -5,7 +5,7 @@
 IFS='
 	 '
 
-XBUILD_VERSION="2.0.0"
+XBUILD_VERSION="3.0.0"
 
 # Defaults (may be overridden by env or CLI)
 : "${XBUILD_ROOTFS:=/}"
@@ -677,8 +677,30 @@ do_build() {
 do_stage_install() {
     STAGE_DIR="$XBUILD_STAGING/$PKG_ID"
     BUILD_DIR="$XBUILD_BUILDDIR/$PKG_ID"
-    SRC_DIR="$BUILD_DIR/src"
-    [ -d "$SRC_DIR" ] || die "missing source dir, run build first: $RECIPE_REF"
+
+    # Locate source dir inside build tree (must match do_build/unpack_source behavior)
+    SRC_BASE="$BUILD_DIR/src"
+    [ -d "$SRC_BASE" ] || die "missing source dir, run build first: $RECIPE_REF"
+
+    if [ -n "${PKG_SUBDIR:-}" ]; then
+        SRC_DIR="$SRC_BASE/$PKG_SUBDIR"
+    else
+        # Best-effort: if a single top directory exists, use it
+        first=""
+        count=0
+        for p in "$SRC_BASE"/*; do
+            [ -e "$p" ] || continue
+            count=$((count+1))
+            first=$p
+        done
+        if [ "$count" -eq 1 ] && [ -d "$first" ]; then
+            SRC_DIR=$first
+        else
+            SRC_DIR=$SRC_BASE
+        fi
+    fi
+    [ -d "$SRC_DIR" ] || die "missing source dir after build: $SRC_DIR"
+
     mkdir_p "$STAGE_DIR"
 
     export_env
@@ -766,7 +788,8 @@ copy_to_rootfs_by_manifest() {
             ln -s "$tgt" "$dst" || die "failed to create symlink: $dst -> $tgt"
         else
             # regular file
-            cp -f "$src" "$dst" || die "failed to copy: $src -> $dst"
+            # Preserve mode/timestamps when possible
+            cp -f -p "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst" || die "failed to copy: $src -> $dst"
         fi
     done <"$mf"
 }
