@@ -1,9 +1,11 @@
 #!/bin/sh
 
+# License: MIT-0
+
 IFS='
 	 '
-# License: MIT-0
-XBUILD_VERSION="1.0.0"
+
+XBUILD_VERSION="2.0.0"
 
 # Defaults (may be overridden by env or CLI)
 : "${XBUILD_ROOTFS:=/}"
@@ -79,6 +81,7 @@ safe_rm_rf() {
     [ -n "$p" ] || die "refusing to rm -rf: empty path"
     case "$p" in
         /|//) die "refusing to rm -rf: $p" ;;
+        .|./|..|../*|*/..|*/../*|*/.|*/./*) die "refusing to rm -rf: unsafe relative path: $p" ;;
     esac
     # Refuse obvious critical paths when strict
     if [ "$XBUILD_STRICT" = "1" ]; then
@@ -95,9 +98,9 @@ xbuild_prepare_tmpdir() {
     if command -v mktemp >/dev/null 2>&1; then
         XBUILD_TMPDIR=$(mktemp -d "$XBUILD_WORK/tmp.xbuild.XXXXXX") || die "cannot create temp dir"
     else
-        # Fallback: best-effort uniqueness
+        # Fallback: avoid mkdir -p (pre-creation race). Fail if path already exists.
         XBUILD_TMPDIR="$XBUILD_WORK/tmp.xbuild.$$.$(date '+%s' 2>/dev/null || echo $$)"
-        mkdir_p "$XBUILD_TMPDIR"
+        mkdir "$XBUILD_TMPDIR" 2>/dev/null || die "cannot create temp dir (mktemp missing): $XBUILD_TMPDIR"
     fi
     # Private
     chmod 700 "$XBUILD_TMPDIR" 2>/dev/null || :
@@ -532,12 +535,17 @@ tar_validate_entries() {
     tf=$1
     need_cmd tar
     tar -tf "$tf" >/dev/null 2>&1 || die "cannot list tar: $tf"
-    tar -tf "$tf" | while IFS= read -r e; do
+
+    # Avoid `... | while ...` subshell semantics in POSIX sh (die must stop the main shell).
+    listf="$XBUILD_TMPDIR/tar.list.$$"
+    tar -tf "$tf" >"$listf" 2>/dev/null || die "cannot list tar: $tf"
+    while IFS= read -r e; do
         [ -n "$e" ] || continue
         # tar lists sometimes include trailing / for dirs
         e_clean=${e%/}
         validate_relpath "$e_clean" || die "unsafe tar entry: $e"
-    done
+    done <"$listf"
+    rm -f "$listf" 2>/dev/null || :
 }
 
 zip_validate_entries() {
@@ -545,11 +553,16 @@ zip_validate_entries() {
     zf=$1
     if command -v unzip >/dev/null 2>&1; then
         unzip -Z1 "$zf" >/dev/null 2>&1 || die "cannot list zip: $zf"
-        unzip -Z1 "$zf" | while IFS= read -r e; do
+
+        # Avoid `... | while ...` subshell semantics in POSIX sh (die must stop the main shell).
+        listf="$XBUILD_TMPDIR/zip.list.$$"
+        unzip -Z1 "$zf" >"$listf" 2>/dev/null || die "cannot list zip: $zf"
+        while IFS= read -r e; do
             [ -n "$e" ] || continue
             e_clean=${e%/}
             validate_relpath "$e_clean" || die "unsafe zip entry: $e"
-        done
+        done <"$listf"
+        rm -f "$listf" 2>/dev/null || :
     else
         die "unzip not found (required for .zip archives)"
     fi
