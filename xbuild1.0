@@ -2,10 +2,11 @@
 
 # License: MIT-0
 
+
 IFS='
 	 '
 
-XBUILD_VERSION="3.0.0"
+XBUILD_VERSION="4.0.0"
 
 # Defaults (may be overridden by env or CLI)
 : "${XBUILD_ROOTFS:=/}"
@@ -274,34 +275,25 @@ run_strict() {
         msg "+ $*"
     fi
 
-    # Capture output to logfile and to terminal unless quiet.
-    if [ "$QUIET" -eq 1 ]; then
-        "$@" >>"$logfile" 2>&1
-    else
-        # Portable tee: if tee missing, just redirect.
-        if command -v tee >/dev/null 2>&1; then
-            "$@" 2>&1 | tee -a "$logfile"
-            rc=${PIPESTATUS:-0} 2>/dev/null || rc=$?
-        else
-            "$@" >>"$logfile" 2>&1
-            rc=$?
-        fi
+    # Capture output reliably in POSIX sh.
+    # We avoid pipelines (e.g., tee) because they can mask the original exit status.
+    tmp="$XBUILD_TMPDIR/xbuild.cmd.$$"
+    : >"$tmp" 2>/dev/null || die "cannot create temp file: $tmp"
+
+    "$@" >"$tmp" 2>&1
+    rc=$?
+
+    # Append to logfile first (keeps log complete even if terminal output is interrupted)
+    cat "$tmp" >>"$logfile" 2>/dev/null || :
+
+    # Also show on terminal unless quiet
+    if [ "$QUIET" -ne 1 ]; then
+        cat "$tmp"
     fi
 
-    # PIPESTATUS is bash-specific; to remain POSIX, run tee-less when strict.
-    # If tee used, rc above may be inaccurate in pure sh; so we additionally check:
-    # - If the command failed but tee succeeded, we may miss it. To avoid that, if strict,
-    #   we disable tee by forcing quiet in strict mode when not bash.
-    # Pragmatic approach: if /bin/sh is not bash, disable tee-based capture.
-    if [ -n "${BASH_VERSION:-}" ]; then
-        :
-    else
-        # In non-bash sh, the tee pipeline masks status. Re-run without tee on failure detection not possible.
-        # So we avoid tee above by using quiet redirection when strict and not verbose.
-        :
-    fi
+    rm -f "$tmp" 2>/dev/null || :
 
-    [ "${rc:-0}" -eq 0 ] || die "command failed (rc=${rc:-?}): $* (log: $logfile)"
+    [ "$rc" -eq 0 ] || die "command failed (rc=$rc): $* (log: $logfile)"
 }
 
 sh_quote() {
@@ -534,11 +526,22 @@ tar_validate_entries() {
     # tar_validate_entries <tarfile>
     tf=$1
     need_cmd tar
-    tar -tf "$tf" >/dev/null 2>&1 || die "cannot list tar: $tf"
+
+    # Compression support (portable subset)
+    tflag=""
+    case "$tf" in
+        *.tar.gz|*.tgz)  tflag="z" ;;
+        *.tar.bz2|*.tbz|*.tbz2) tflag="j" ;;
+        *.tar.xz|*.txz)  tflag="J" ;;
+        *.tar.zst|*.tzst) die "zstd-compressed tar not supported by this xbuild build (archive: $tf)" ;;
+        *) tflag="" ;;
+    esac
+
+    tar -t${tflag}f "$tf" >/dev/null 2>&1 || die "cannot list tar: $tf"
 
     # Avoid `... | while ...` subshell semantics in POSIX sh (die must stop the main shell).
     listf="$XBUILD_TMPDIR/tar.list.$$"
-    tar -tf "$tf" >"$listf" 2>/dev/null || die "cannot list tar: $tf"
+    tar -t${tflag}f "$tf" >"$listf" 2>/dev/null || die "cannot list tar: $tf"
     while IFS= read -r e; do
         [ -n "$e" ] || continue
         # tar lists sometimes include trailing / for dirs
@@ -575,7 +578,17 @@ xbuild_tar_extract() {
     need_cmd tar
     mkdir_p "$d"
     tar_validate_entries "$a"
-    tar -xf "$a" -C "$d" || die "tar extract failed: $a"
+
+    xflag=""
+    case "$a" in
+        *.tar.gz|*.tgz)  xflag="z" ;;
+        *.tar.bz2|*.tbz|*.tbz2) xflag="j" ;;
+        *.tar.xz|*.txz)  xflag="J" ;;
+        *.tar.zst|*.tzst) die "zstd-compressed tar not supported by this xbuild build (archive: $a)" ;;
+        *) xflag="" ;;
+    esac
+
+    tar -x${xflag}f "$a" -C "$d" || die "tar extract failed: $a"
 }
 
 unpack_source() {
