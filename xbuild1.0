@@ -1,21 +1,32 @@
 #!/bin/sh
+# xbuild 1.0
+# Minimal source fetch/build/install manager (POSIX sh)
 # License: MIT-0
+
+# =========================
+# Globals / defaults
+# =========================
+
+# POSIX strictness: use -u (undefined vars), avoid -e globally (edge cases w/ conditionals)
+set -u
 
 IFS='
 	 '
 
-XBUILD_VERSION="0.0.1"
+XBUILD_VERSION="1.0"
 
 : "${XBUILD_ROOTFS:=/}"
 : "${XBUILD_PREFIX:=/usr}"
-: "${XBUILD_RECIPES:=/etc/xbuild/recipes}"
-: "${XBUILD_WORK:=/var/tmp/xbuild}"
+: "${XBUILD_WORK:=$HOME/.xbuild}"
+: "${XBUILD_RECIPES:=$XBUILD_WORK/recipes}"
+
 : "${XBUILD_CACHE:=$XBUILD_WORK/cache}"
 : "${XBUILD_SOURCES:=$XBUILD_WORK/sources}"
 : "${XBUILD_BUILDDIR:=$XBUILD_WORK/build}"
 : "${XBUILD_STAGING:=$XBUILD_WORK/staging}"
 : "${XBUILD_DB:=$XBUILD_WORK/db}"
 : "${XBUILD_LOGS:=$XBUILD_WORK/logs}"
+
 : "${XBUILD_JOBS:=}"
 : "${XBUILD_KEEP_BUILD:=0}"
 : "${XBUILD_ASSUME_YES:=0}"
@@ -24,179 +35,144 @@ XBUILD_VERSION="0.0.1"
 
 QUIET=0
 VERBOSE=0
+
 CMD=""
 PKGARG=""
 RECIPE_FILE=""
 RECIPE_REF=""
 PKG_CATEGORY=""
-PKG_NAME=""
-PKG_VERSION=""
-PKG_ID=""
-PKG_URL=""
-PKG_SHA256=""
-PKG_ARCHIVE=""
-PKG_SUBDIR=""
-PKG_CONFIGURE=""
-PKG_BUILD=""
-PKG_INSTALL=""
 
-XBUILD_TMPDIR=""
 LOCKDIR=""
+XBUILD_TMPDIR=""
 
 # =========================
-# Logging
+# Logging / errors
 # =========================
-msg()  { [ "$QUIET" -eq 1 ] && return 0; printf '%s\n' "$*"; }
-warn() { printf 'xbuild: warning: %s\n' "$*" >&2; }
-die()  { printf 'xbuild: error: %s\n' "$*" >&2; cleanup_common >/dev/null 2>&1 || :; exit 1; }
 
-# =========================
-# Utilities
-# =========================
-need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
+msg()  { [ "$QUIET" -eq 1 ] && return 0; printf '%s\n' "$*" >&2; }
+warn() { printf 'warn: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-is_abs() {
-    case "$1" in
-        /*) return 0 ;;
-        *)  return 1 ;;
-    esac
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
 
-mkdir_p() {
-    # POSIX mkdir -p
-    [ -n "$1" ] || die "internal: mkdir_p empty path"
-    mkdir -p "$1" 2>/dev/null || die "cannot create directory: $1"
-}
+is_abs() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
 
-now_utc() {
-    date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ'
-}
+mkdir_p() { mkdir -p "$1" 2>/dev/null || { mkdir -p "$1" || die "cannot create dir: $1"; }; }
+
+now_utc() { date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%SZ'; }
 
 safe_rm_rf() {
-    p=$1
-    [ -n "$p" ] || die "refusing to rm -rf: empty path"
-    case "$p" in
-        /|//) die "refusing to rm -rf: $p" ;;
-    esac
-    # Refuse obvious critical paths when strict
-    if [ "$XBUILD_STRICT" = "1" ]; then
-        case "$p" in
-            /bin|/sbin|/usr|/usr/*|/etc|/var|/home) die "refusing to rm -rf critical path: $p" ;;
-        esac
-    fi
-    rm -rf -- "$p" 2>/dev/null || rm -rf "$p" 2>/dev/null || die "failed to remove: $p"
+	p=$1
+	[ -n "$p" ] || die "refusing to rm -rf: empty path"
+	case "$p" in
+		/|//) die "refusing to rm -rf: $p" ;;
+	esac
+	if [ "$XBUILD_STRICT" = "1" ]; then
+		case "$p" in
+			/bin|/sbin|/usr|/usr/*|/etc|/var|/home|/lib|/lib/*|/proc|/sys|/dev)
+				die "refusing to rm -rf critical path: $p"
+				;;
+		esac
+	fi
+	rm -rf -- "$p" 2>/dev/null || rm -rf "$p" 2>/dev/null || die "failed to remove: $p"
 }
 
 xbuild_prepare_tmpdir() {
-    [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ] && return 0
-    mkdir_p "$XBUILD_WORK"
-    if command -v mktemp >/dev/null 2>&1; then
-        XBUILD_TMPDIR=$(mktemp -d "$XBUILD_WORK/tmp.xbuild.XXXXXX") || die "cannot create temp dir"
-    else
-        # Fallback: best-effort uniqueness
-        XBUILD_TMPDIR="$XBUILD_WORK/tmp.xbuild.$$.$(date '+%s' 2>/dev/null || echo $$)"
-        mkdir_p "$XBUILD_TMPDIR"
-    fi
-    # Private
-    chmod 700 "$XBUILD_TMPDIR" 2>/dev/null || :
+	[ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ] && return 0
+	mkdir_p "$XBUILD_WORK"
+	if command -v mktemp >/dev/null 2>&1; then
+		XBUILD_TMPDIR=$(mktemp -d "$XBUILD_WORK/tmp.xbuild.XXXXXX") || die "cannot create temp dir"
+	else
+		XBUILD_TMPDIR="$XBUILD_WORK/tmp.xbuild.$$.$(date '+%s' 2>/dev/null || echo $$)"
+		mkdir_p "$XBUILD_TMPDIR"
+	fi
+	chmod 700 "$XBUILD_TMPDIR" 2>/dev/null || :
 }
 
 confirm() {
-    prompt=$1
-    if [ "$XBUILD_ASSUME_YES" = "1" ]; then
-        return 0
-    fi
-    printf '%s [y/N] ' "$prompt" >&2
-    read ans || return 1
-    case "$ans" in
-        y|Y|yes|YES) return 0 ;;
-        *) return 1 ;;
-    esac
+	prompt=$1
+	[ "$XBUILD_ASSUME_YES" = "1" ] && return 0
+	printf '%s [y/N] ' "$prompt" >&2
+	read ans || return 1
+	case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
 # =========================
-# Locking & cleanup
+# Locking / cleanup
 # =========================
+
 lock_acquire() {
-    LOCKDIR="$XBUILD_WORK/.lock"
-    mkdir_p "$XBUILD_WORK"
+	LOCKDIR="$XBUILD_WORK/.lock"
+	mkdir_p "$XBUILD_WORK"
 
-    i=0
-    while ! mkdir "$LOCKDIR" 2>/dev/null; do
-        # If we have a pid file, check for staleness.
-        if [ -f "$LOCKDIR/pid" ]; then
-            lpid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
-            case "$lpid" in
-                ''|*[!0-9]*) : ;;
-                *)
-                    if kill -0 "$lpid" 2>/dev/null; then
-                        : # still running
-                    else
-                        warn "stale lock detected (pid=$lpid); recovering"
-                        safe_rm_rf "$LOCKDIR"
-                        continue
-                    fi
-                    ;;
-            esac
-        else
-            # Lock exists but no pid file; treat stale after short grace.
-            i=$((i+1))
-            if [ "$i" -ge 3 ]; then
-                warn "lock dir exists without pid; recovering"
-                safe_rm_rf "$LOCKDIR"
-                continue
-            fi
-        fi
+	i=0
+	while ! mkdir "$LOCKDIR" 2>/dev/null; do
+		if [ -f "$LOCKDIR/pid" ]; then
+			lpid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+			case "$lpid" in
+				''|*[!0-9]*) : ;;
+				*)
+					if kill -0 "$lpid" 2>/dev/null; then
+						: # still running
+					else
+						warn "stale lock detected (pid=$lpid); recovering"
+						safe_rm_rf "$LOCKDIR"
+						continue
+					fi
+					;;
+			esac
+		else
+			i=$((i+1))
+			if [ "$i" -ge 3 ]; then
+				warn "lock dir exists without pid; recovering"
+				safe_rm_rf "$LOCKDIR"
+				continue
+			fi
+		fi
 
-        i=$((i+1))
-        [ "$i" -le 120 ] || die "lock timeout (another xbuild running?)"
-        sleep 1
-    done
+		i=$((i+1))
+		[ "$i" -le 120 ] || die "lock timeout (another xbuild running?)"
+		sleep 1
+	done
 
-    # We now own the lock directory.
-    printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || :
+	printf '%s\n' "$$" >"$LOCKDIR/pid" 2>/dev/null || :
 }
 
 lock_release() {
-    [ -n "${LOCKDIR:-}" ] || return 0
-    if [ -d "$LOCKDIR" ]; then
-        # Only remove if we own it (best effort)
-        if [ -f "$LOCKDIR/pid" ]; then
-            lpid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
-            if [ "$lpid" = "$$" ]; then
-                safe_rm_rf "$LOCKDIR"
-            fi
-        else
-            safe_rm_rf "$LOCKDIR"
-        fi
-    fi
-    LOCKDIR=""
+	[ -n "${LOCKDIR:-}" ] || return 0
+	if [ -d "$LOCKDIR" ]; then
+		if [ -f "$LOCKDIR/pid" ]; then
+			lpid=$(cat "$LOCKDIR/pid" 2>/dev/null || echo "")
+			if [ "$lpid" = "$$" ]; then
+				safe_rm_rf "$LOCKDIR"
+			fi
+		else
+			safe_rm_rf "$LOCKDIR"
+		fi
+	fi
+	LOCKDIR=""
 }
 
 cleanup_common() {
-    # Best-effort cleanup; never hard-fail here.
-    if [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ]; then
-        safe_rm_rf "$XBUILD_TMPDIR" 2>/dev/null || :
-    fi
-    XBUILD_TMPDIR=""
-    lock_release 2>/dev/null || :
+	if [ -n "${XBUILD_TMPDIR:-}" ] && [ -d "$XBUILD_TMPDIR" ]; then
+		safe_rm_rf "$XBUILD_TMPDIR" 2>/dev/null || :
+	fi
+	XBUILD_TMPDIR=""
+	lock_release 2>/dev/null || :
 }
 
 on_exit() { cleanup_common; }
 on_signal() {
-    sig=$1
-    cleanup_common
-    case "$sig" in
-        INT)  exit 130 ;;  # 128 + 2
-        HUP)  exit 129 ;;  # 128 + 1
-        TERM) exit 143 ;;  # 128 + 15
-        *)    exit 1 ;;
-    esac
+	sig=$1
+	cleanup_common
+	case "$sig" in
+		INT)  exit 130 ;;
+		HUP)  exit 129 ;;
+		TERM) exit 143 ;;
+		*)    exit 1 ;;
+	esac
 }
 
-# Install traps once
 trap 'on_exit' EXIT
 trap 'on_signal INT' INT
 trap 'on_signal HUP' HUP
@@ -205,803 +181,724 @@ trap 'on_signal TERM' TERM
 # =========================
 # Help
 # =========================
+
 usage() {
 cat <<'EOF'
 xbuild - minimal source fetch/build/install manager
 
 USAGE:
-  xbuild <cmd> [options] <pkg>
-  xbuild <cmd> [options] <category/pkg>
-  xbuild remove|r [options] <pkgid>   (e.g., zlib-1.3.1)
+  xbuild [opts] <command> <pkg>
 
-COMMANDS (and abbreviations):
-  fetch      (f)     Download source archive + verify SHA256 + store in cache
-  build      (b)     Unpack + build in isolated build dir
-  install    (i)     Stage install into DESTDIR + register + then copy into ROOTFS
-  remove     (r)     Uninstall registered files from ROOTFS (by pkgid or recipe ref)
-  list       (ls)    List installed packages
-  info       (in)    Show recipe + installed metadata
-  clean      (cl)    Remove build/staging dirs for a package (keeps sources)
-  help       (h)     Show help
+COMMANDS:
+  fetch|f      fetch source archive
+  build|b      unpack + build
+  install|i    stage install + collision check + install into rootfs
+  remove|r     remove installed package by pkgid or recipe ref/name
+  clean|cl     remove build + staging for recipe
+  list|ls      list installed packages
+  info|in      show recipe metadata and installed status
+  help|h       show this help
 
-OPTIONS:
-  -R, --rootfs PATH        Final rootfs (default: /)
-  -P, --prefix PATH        Prefix inside ROOTFS (default: /usr)
-  -r, --recipes PATH       Recipes directory (default: /etc/xbuild/recipes)
-  -j, --jobs N             Parallel jobs (default: detected CPU count)
-  -k, --keep-build         Keep build dir after success
-  -y, --yes                Assume "yes" for prompts
-  -q, --quiet              Less output
-  -v, --verbose            More output
-  --                       End of options
+OPTS:
+  -R, --rootfs <dir>    root filesystem (default: /)
+  -P, --prefix <dir>    install prefix under rootfs (default: /usr)
+  -r, --recipes <dir>   recipes dir (default: $XBUILD_WORK/recipes)
+  -j, --jobs <n>        parallel jobs
+  -k, --keep-build      keep build dir
+  -y, --yes             assume yes
+  -q, --quiet           quiet output
+  -v, --verbose         verbose output
 
-ENV overrides:
-  XBUILD_ROOTFS XBUILD_PREFIX XBUILD_RECIPES XBUILD_WORK XBUILD_CACHE XBUILD_SOURCES
-  XBUILD_BUILDDIR XBUILD_STAGING XBUILD_DB XBUILD_LOGS XBUILD_JOBS XBUILD_KEEP_BUILD
-  XBUILD_ASSUME_YES XBUILD_STRICT XBUILD_FORCE
-
-RECIPE FORMAT:
-  $XBUILD_RECIPES/<category>/<name>.sh
-
-Required recipe variables:
-  PKG_NAME, PKG_VERSION, PKG_URL, PKG_SHA256
-
-Optional recipe variables:
-  PKG_ARCHIVE    (filename override; default derived from URL)
-  PKG_SUBDIR     (directory inside archive; default: first directory entry)
-  PKG_CONFIGURE  (command)
-  PKG_BUILD      (command)
-  PKG_INSTALL    (command; should honor DESTDIR)
-
-Optional recipe functions (preferred over strings):
-  pkg_prepare()  pkg_configure()  pkg_build()  pkg_install()
+ENV:
+  XBUILD_WORK XBUILD_ROOTFS XBUILD_PREFIX XBUILD_RECIPES
+  XBUILD_JOBS XBUILD_KEEP_BUILD XBUILD_ASSUME_YES
+  XBUILD_STRICT XBUILD_FORCE
 EOF
 }
 
 # =========================
-# Command execution helpers
+# Exec helper (CRITICAL FIX)
 # =========================
+# POSIX-safe: never use a pipeline for logging if you need reliable exit status.
+
 run_strict() {
-    # run_strict <logfile> <cmd...>
-    logfile=$1; shift
-    [ -n "$logfile" ] || die "internal: run_strict missing logfile"
-    mkdir_p "$(dirname "$logfile")"
+	# run_strict <logfile> <cmd...>
+	logfile=$1; shift
+	[ -n "$logfile" ] || die "internal: run_strict missing logfile"
+	mkdir_p "$(dirname "$logfile")"
 
-    if [ "$VERBOSE" -eq 1 ]; then
-        msg "+ $*"
-    fi
+	[ "$VERBOSE" -eq 1 ] && msg "+ $*"
 
-    # Capture output to logfile and to terminal unless quiet.
-    if [ "$QUIET" -eq 1 ]; then
-        "$@" >>"$logfile" 2>&1
-    else
-        # Portable tee: if tee missing, just redirect.
-        if command -v tee >/dev/null 2>&1; then
-            "$@" 2>&1 | tee -a "$logfile"
-            rc=${PIPESTATUS:-0} 2>/dev/null || rc=$?
-        else
-            "$@" >>"$logfile" 2>&1
-            rc=$?
-        fi
-    fi
+	# Always capture output reliably.
+	# If not quiet, we will print the output after command completes.
+	tmpout=""
+	if [ "$QUIET" -eq 0 ]; then
+		xbuild_prepare_tmpdir
+		tmpout="$XBUILD_TMPDIR/cmd.$$.out"
+		: >"$tmpout" || die "cannot write tmp output"
+	fi
 
-    # PIPESTATUS is bash-specific; to remain POSIX, run tee-less when strict.
-    # If tee used, rc above may be inaccurate in pure sh; so we additionally check:
-    # - If the command failed but tee succeeded, we may miss it. To avoid that, if strict,
-    #   we disable tee by forcing quiet in strict mode when not bash.
-    # Pragmatic approach: if /bin/sh is not bash, disable tee-based capture.
-    if [ -n "${BASH_VERSION:-}" ]; then
-        :
-    else
-        # In non-bash sh, the tee pipeline masks status. Re-run without tee on failure detection not possible.
-        # So we avoid tee above by using quiet redirection when strict and not verbose.
-        :
-    fi
+	if [ "$QUIET" -eq 1 ]; then
+		"$@" >>"$logfile" 2>&1
+		rc=$?
+	else
+		"$@" >"$tmpout" 2>&1
+		rc=$?
+		cat "$tmpout" >>"$logfile" 2>&1 || :
+		cat "$tmpout" >&2 || :
+	fi
 
-    [ "${rc:-0}" -eq 0 ] || die "command failed (rc=${rc:-?}): $* (log: $logfile)"
-}
-
-sh_quote() {
-    # minimal shell quoting for display
-    s=$1
-    printf "%s" "$s" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/"
+	[ "$rc" -eq 0 ] || die "command failed (rc=$rc): $* (log: $logfile)"
 }
 
 # =========================
-# Environment / jobs
+# Environment / jobs / paths
 # =========================
+
 cpu_count() {
-    # best effort
-    if command -v getconf >/dev/null 2>&1; then
-        n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "")
-        case "$n" in ''|*[!0-9]*) : ;; *) echo "$n"; return 0 ;; esac
-    fi
-    if command -v sysctl >/dev/null 2>&1; then
-        n=$(sysctl -n hw.ncpu 2>/dev/null || echo "")
-        case "$n" in ''|*[!0-9]*) : ;; *) echo "$n"; return 0 ;; esac
-    fi
-    echo 1
+	if command -v getconf >/dev/null 2>&1; then
+		n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "")
+		case "$n" in ''|*[!0-9]*|0) : ;; *) echo "$n"; return 0 ;; esac
+	fi
+	if command -v sysctl >/dev/null 2>&1; then
+		n=$(sysctl -n hw.ncpu 2>/dev/null || echo "")
+		case "$n" in ''|*[!0-9]*|0) : ;; *) echo "$n"; return 0 ;; esac
+	fi
+	echo 1
 }
 
 paths_init() {
-    mkdir_p "$XBUILD_WORK"
-    mkdir_p "$XBUILD_CACHE"
-    mkdir_p "$XBUILD_SOURCES"
-    mkdir_p "$XBUILD_BUILDDIR"
-    mkdir_p "$XBUILD_STAGING"
-    mkdir_p "$XBUILD_DB"
-    mkdir_p "$XBUILD_LOGS"
-    xbuild_prepare_tmpdir
+	mkdir_p "$XBUILD_WORK"
+	mkdir_p "$XBUILD_CACHE"
+	mkdir_p "$XBUILD_SOURCES"
+	mkdir_p "$XBUILD_BUILDDIR"
+	mkdir_p "$XBUILD_STAGING"
+	mkdir_p "$XBUILD_DB"
+	mkdir_p "$XBUILD_LOGS"
 
-    # Normalize jobs
-    if [ -z "${XBUILD_JOBS:-}" ]; then
-        XBUILD_JOBS=$(cpu_count)
-    fi
-    case "$XBUILD_JOBS" in
-        ''|*[!0-9]*|0) die "invalid jobs count: $XBUILD_JOBS" ;;
-    esac
+	if [ -z "${XBUILD_JOBS:-}" ]; then
+		XBUILD_JOBS=$(cpu_count)
+	fi
+	case "$XBUILD_JOBS" in ''|*[!0-9]*|0) die "invalid jobs count: $XBUILD_JOBS" ;; esac
 
-    if [ "$XBUILD_STRICT" = "1" ]; then
-        is_abs "$XBUILD_PREFIX" || die "prefix must be absolute: $XBUILD_PREFIX"
-        is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
-        is_abs "$XBUILD_WORK"   || die "work dir must be absolute: $XBUILD_WORK"
-        # refuse obvious symlinked roots in strict mode
-        [ ! -L "$XBUILD_ROOTFS" ] || die "refusing symlink rootfs: $XBUILD_ROOTFS"
-        [ ! -L "$XBUILD_RECIPES" ] || die "refusing symlink recipes dir: $XBUILD_RECIPES"
-    fi
+	if [ "$XBUILD_STRICT" = "1" ]; then
+		is_abs "$XBUILD_PREFIX" || die "prefix must be absolute: $XBUILD_PREFIX"
+		is_abs "$XBUILD_ROOTFS" || die "rootfs must be absolute: $XBUILD_ROOTFS"
+		is_abs "$XBUILD_WORK"   || die "work dir must be absolute: $XBUILD_WORK"
+		[ ! -L "$XBUILD_ROOTFS" ] || die "refusing symlink rootfs: $XBUILD_ROOTFS"
+		[ ! -L "$XBUILD_RECIPES" ] || die "refusing symlink recipes dir: $XBUILD_RECIPES"
+	fi
+}
+
+export_env() {
+	export DESTDIR="$STAGE_DIR"
+	export PREFIX="$XBUILD_PREFIX"
+	export ROOTFS="$XBUILD_ROOTFS"
+	export MAKEFLAGS="-j$XBUILD_JOBS"
 }
 
 # =========================
 # Downloading & hashing
 # =========================
+
 downloader_detect() {
-    if command -v curl >/dev/null 2>&1; then
-        echo "curl"
-        return 0
-    fi
-    if command -v wget >/dev/null 2>&1; then
-        echo "wget"
-        return 0
-    fi
-    return 1
+	if command -v curl >/dev/null 2>&1; then echo "curl"; return 0; fi
+	if command -v wget >/dev/null 2>&1; then echo "wget"; return 0; fi
+	return 1
 }
 
 download_file() {
-    # download_file <url> <out>
-    url=$1
-    out=$2
-    [ -n "$url" ] || die "download_file: empty url"
-    [ -n "$out" ] || die "download_file: empty out"
-    mkdir_p "$(dirname "$out")"
+	url=$1
+	out=$2
+	[ -n "$url" ] || die "download_file: empty url"
+	[ -n "$out" ] || die "download_file: empty out"
+	mkdir_p "$(dirname "$out")"
 
-    # Support local file URLs
-    case "$url" in
-        file://*)
-            src=${url#file://}
-            [ -f "$src" ] || die "file url not found: $src"
-            cp -f "$src" "$out" || die "copy failed: $src -> $out"
-            return 0
-            ;;
-    esac
+	case "$url" in
+		file://*)
+			src=${url#file://}
+			[ -f "$src" ] || die "file url not found: $src"
+			cp -f "$src" "$out" || die "copy failed: $src -> $out"
+			return 0
+			;;
+	esac
 
-    dl=$(downloader_detect) || die "need curl or wget for downloads"
-    if [ "$dl" = "curl" ]; then
-        # -f: fail; -L: follow redirects; --retry: resiliency
-        curl -fL --retry 3 --retry-delay 2 -o "$out" "$url" || die "download failed: $url"
-    else
-        wget -O "$out" "$url" || die "download failed: $url"
-    fi
+	dl=$(downloader_detect) || die "need curl or wget for downloads"
+	if [ "$dl" = "curl" ]; then
+		curl -fL --retry 3 --retry-delay 2 -o "$out" "$url" || die "download failed: $url"
+	else
+		# best-effort flags portability
+		wget -O "$out" "$url" || die "download failed: $url"
+	fi
 }
 
 sha256_compute() {
-    f=$1
-    [ -f "$f" ] || die "sha256_compute: file not found: $f"
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$f" | awk '{print $1}'
-        return 0
-    fi
-    if command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$f" | awk '{print $1}'
-        return 0
-    fi
-    if command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
-        return 0
-    fi
-    die "no sha256 tool found (sha256sum/shasum/openssl)"
+	f=$1
+	[ -f "$f" ] || die "sha256_compute: file not found: $f"
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f" | awk '{print $1}'; return 0; fi
+	if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$f" | awk '{print $1}'; return 0; fi
+	if command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'; return 0; fi
+	die "no sha256 tool found (sha256sum/shasum/openssl)"
 }
 
 sha256_check() {
-    # sha256_check <file> <expected>
-    f=$1
-    exp=$2
-    [ -f "$f" ] || die "file not found: $f"
-    [ -n "$exp" ] || die "missing expected sha256"
-    got=$(sha256_compute "$f")
-    [ "$got" = "$exp" ] || die "sha256 mismatch for $(basename "$f"): expected $exp got $got"
+	f=$1
+	exp=$2
+	[ -f "$f" ] || die "file not found: $f"
+	[ -n "$exp" ] || die "missing expected sha256"
+	got=$(sha256_compute "$f")
+	[ "$got" = "$exp" ] || die "sha256 mismatch for $(basename "$f"): expected $exp got $got"
 }
 
 # =========================
 # Recipe loading
 # =========================
+
 recipe_find() {
-    # recipe_find <pkgarg> => prints file
-    a=$1
-    [ -n "$a" ] || die "missing package argument"
-    case "$a" in
-        */*)
-            cat=$(printf '%s' "$a" | awk -F/ '{print $1}')
-            name=$(printf '%s' "$a" | awk -F/ '{print $2}')
-            ;;
-        *)
-            # Search unique match by name across categories
-            cat=""
-            name=$a
-            ;;
-    esac
+	a=$1
+	[ -n "$a" ] || die "missing package argument"
+	case "$a" in
+		*/*)
+			cat=$(printf '%s' "$a" | awk -F/ '{print $1}')
+			name=$(printf '%s' "$a" | awk -F/ '{print $2}')
+			;;
+		*)
+			cat=""
+			name=$a
+			;;
+	esac
 
-    if [ -n "$cat" ]; then
-        f="$XBUILD_RECIPES/$cat/$name.sh"
-        [ -f "$f" ] || die "recipe not found: $f"
-        echo "$f"
-        return 0
-    fi
+	if [ -n "$cat" ]; then
+		f="$XBUILD_RECIPES/$cat/$name.sh"
+		[ -f "$f" ] || die "recipe not found: $cat/$name"
+		echo "$f"
+		return 0
+	fi
 
-    # Find first match; in strict mode require uniqueness.
-    found=""
-    for f in "$XBUILD_RECIPES"/*/"$name".sh; do
-        [ -f "$f" ] || continue
-        if [ -z "$found" ]; then
-            found=$f
-        else
-            if [ "$XBUILD_STRICT" = "1" ]; then
-                die "ambiguous recipe name '$name' (use category/name). Matches: $found and $f"
-            fi
-        fi
-    done
-    [ -n "$found" ] || die "recipe not found for: $name"
-    echo "$found"
+	found=""
+	for f in "$XBUILD_RECIPES"/*/"$name".sh; do
+		[ -f "$f" ] || continue
+		if [ -z "$found" ]; then
+			found=$f
+		else
+			if [ "$XBUILD_STRICT" = "1" ]; then
+				die "ambiguous recipe name '$name' (use category/name). Matches: $found and $f"
+			fi
+		fi
+	done
+	[ -n "$found" ] || die "recipe not found for: $name"
+	echo "$found"
 }
 
 recipe_load() {
-    # recipe_load <file>
-    f=$1
-    [ -f "$f" ] || die "recipe not found: $f"
+	f=$1
+	[ -f "$f" ] || die "recipe not found: $f"
 
-    # Reset recipe variables (avoid leakage)
-    PKG_CATEGORY=""
-    PKG_NAME=""
-    PKG_VERSION=""
-    PKG_URL=""
-    PKG_SHA256=""
-    PKG_ARCHIVE=""
-    PKG_SUBDIR=""
-    PKG_CONFIGURE=""
-    PKG_BUILD=""
-    PKG_INSTALL=""
+	PKG_CATEGORY=""
+	PKG_NAME=""
+	PKG_VERSION=""
+	PKG_URL=""
+	PKG_SHA256=""
+	PKG_ARCHIVE=""
+	PKG_SUBDIR=""
+	PKG_CONFIGURE=""
+	PKG_BUILD=""
+	PKG_INSTALL=""
 
-    # Unset optional functions if present from previous recipe
-    unset -f pkg_prepare >/dev/null 2>&1 || :
-    unset -f pkg_configure >/dev/null 2>&1 || :
-    unset -f pkg_build >/dev/null 2>&1 || :
-    unset -f pkg_install >/dev/null 2>&1 || :
+	unset -f pkg_prepare  >/dev/null 2>&1 || :
+	unset -f pkg_configure >/dev/null 2>&1 || :
+	unset -f pkg_build    >/dev/null 2>&1 || :
+	unset -f pkg_install  >/dev/null 2>&1 || :
 
-    # shellcheck disable=SC1090
-    . "$f" || die "failed to source recipe: $f"
+	# shellcheck disable=SC1090
+	. "$f" || die "failed to source recipe: $f"
 
-    [ -n "${PKG_NAME:-}" ] || die "recipe missing PKG_NAME ($f)"
-    [ -n "${PKG_VERSION:-}" ] || die "recipe missing PKG_VERSION ($f)"
-    [ -n "${PKG_URL:-}" ] || die "recipe missing PKG_URL ($f)"
-    [ -n "${PKG_SHA256:-}" ] || die "recipe missing PKG_SHA256 ($f)"
+	[ -n "${PKG_NAME:-}" ] || die "recipe missing PKG_NAME ($f)"
+	[ -n "${PKG_VERSION:-}" ] || die "recipe missing PKG_VERSION ($f)"
+	[ -n "${PKG_URL:-}" ] || die "recipe missing PKG_URL ($f)"
+	[ -n "${PKG_SHA256:-}" ] || die "recipe missing PKG_SHA256 ($f)"
 
-    # Infer category from path
-    PKG_CATEGORY=$(basename "$(dirname "$f")")
-    PKG_ID="${PKG_NAME}-${PKG_VERSION}"
+	PKG_CATEGORY=$(basename "$(dirname "$f")")
+	PKG_ID="${PKG_NAME}-${PKG_VERSION}"
 
-    # Determine archive name
-    if [ -z "${PKG_ARCHIVE:-}" ]; then
-        PKG_ARCHIVE=$(basename "$PKG_URL")
-        [ -n "$PKG_ARCHIVE" ] || PKG_ARCHIVE="${PKG_ID}.tar"
-    fi
+	if [ -z "${PKG_ARCHIVE:-}" ]; then
+		PKG_ARCHIVE=$(basename "$PKG_URL")
+		[ -n "$PKG_ARCHIVE" ] || PKG_ARCHIVE="${PKG_ID}.tar"
+	fi
 
-    RECIPE_FILE=$f
-    RECIPE_REF="${PKG_CATEGORY}/${PKG_NAME}"
+	RECIPE_FILE=$f
+	RECIPE_REF="${PKG_CATEGORY}/${PKG_NAME}"
 }
 
 # =========================
-# Archive validation & extract
+# Archive validation & extract (CRITICAL FIX)
 # =========================
+
 validate_relpath() {
-    # validate_relpath <path> (must be relative, no .., no leading /)
-    p=$1
-    [ -n "$p" ] || return 1
-    case "$p" in
-        /*) return 1 ;;
-        *'..'*)
-            # Disallow any .. component
-            case "$p" in
-                *'../'*|*'/..'*|..|../*|*/..) return 1 ;;
-            esac
-            ;;
-    esac
-    return 0
+	p=$1
+	[ -n "$p" ] || return 1
+	case "$p" in
+		/*) return 1 ;;
+		*'..'*)
+			case "$p" in
+				*'../'*|*'/..'*|..|../*|*/..) return 1 ;;
+			esac
+			;;
+	esac
+	return 0
 }
 
 tar_validate_entries() {
-    # tar_validate_entries <tarfile>
-    tf=$1
-    need_cmd tar
-    tar -tf "$tf" >/dev/null 2>&1 || die "cannot list tar: $tf"
-    tar -tf "$tf" | while IFS= read -r e; do
-        [ -n "$e" ] || continue
-        # tar lists sometimes include trailing / for dirs
-        e_clean=${e%/}
-        validate_relpath "$e_clean" || die "unsafe tar entry: $e"
-    done
+	tf=$1
+	need_cmd tar
+	xbuild_prepare_tmpdir
+	list="$XBUILD_TMPDIR/tar.$$.list"
+
+	tar -tf "$tf" >"$list" 2>/dev/null || die "cannot list tar: $tf"
+	while IFS= read -r e; do
+		[ -n "$e" ] || continue
+		e_clean=${e%/}
+		validate_relpath "$e_clean" || die "unsafe tar entry: $e"
+	done <"$list"
 }
 
 zip_validate_entries() {
-    # zip_validate_entries <zipfile>
-    zf=$1
-    if command -v unzip >/dev/null 2>&1; then
-        unzip -Z1 "$zf" >/dev/null 2>&1 || die "cannot list zip: $zf"
-        unzip -Z1 "$zf" | while IFS= read -r e; do
-            [ -n "$e" ] || continue
-            e_clean=${e%/}
-            validate_relpath "$e_clean" || die "unsafe zip entry: $e"
-        done
-    else
-        die "unzip not found (required for .zip archives)"
-    fi
+	zf=$1
+	command -v unzip >/dev/null 2>&1 || die "unzip not found (required for .zip archives)"
+	xbuild_prepare_tmpdir
+	list="$XBUILD_TMPDIR/zip.$$.list"
+
+	unzip -Z1 "$zf" >"$list" 2>/dev/null || die "cannot list zip: $zf"
+	while IFS= read -r e; do
+		[ -n "$e" ] || continue
+		e_clean=${e%/}
+		validate_relpath "$e_clean" || die "unsafe zip entry: $e"
+	done <"$list"
 }
 
 xbuild_tar_extract() {
-    # xbuild_tar_extract <archive> <destdir>
-    a=$1
-    d=$2
-    need_cmd tar
-    mkdir_p "$d"
-    tar_validate_entries "$a"
-    tar -xf "$a" -C "$d" || die "tar extract failed: $a"
+	a=$1
+	d=$2
+	need_cmd tar
+	mkdir_p "$d"
+	tar_validate_entries "$a"
+	tar -xf "$a" -C "$d" || die "tar extract failed: $a"
 }
 
 unpack_source() {
-    # unpack_source <archive> <destdir> => sets SRC_DIR
-    a=$1
-    d=$2
-    [ -f "$a" ] || die "archive not found: $a"
-    safe_rm_rf "$d" 2>/dev/null || :
-    mkdir_p "$d"
+	a=$1
+	d=$2
+	[ -f "$a" ] || die "archive not found: $a"
+	safe_rm_rf "$d" 2>/dev/null || :
+	mkdir_p "$d"
 
-    case "$a" in
-        *.zip)
-            zip_validate_entries "$a"
-            unzip -q "$a" -d "$d" || die "zip extract failed: $a"
-            ;;
-        *)
-            xbuild_tar_extract "$a" "$d"
-            ;;
-    esac
+	case "$a" in
+		*.zip)
+			zip_validate_entries "$a"
+			unzip -q "$a" -d "$d" || die "zip extract failed: $a"
+			;;
+		*)
+			xbuild_tar_extract "$a" "$d"
+			;;
+	esac
 
-    # Determine top-level directory
-    if [ -n "${PKG_SUBDIR:-}" ]; then
-        SRC_DIR="$d/$PKG_SUBDIR"
-    else
-        # Best-effort: if single top directory exists, use it
-        first=""
-        count=0
-        for p in "$d"/*; do
-            [ -e "$p" ] || continue
-            count=$((count+1))
-            first=$p
-        done
-        if [ "$count" -eq 1 ] && [ -d "$first" ]; then
-            SRC_DIR=$first
-        else
-            SRC_DIR=$d
-        fi
-    fi
-    [ -d "$SRC_DIR" ] || die "source dir not found after unpack: $SRC_DIR"
+	if [ -n "${PKG_SUBDIR:-}" ]; then
+		SRC_DIR="$d/$PKG_SUBDIR"
+	else
+		first=""
+		count=0
+		for p in "$d"/*; do
+			[ -e "$p" ] || continue
+			count=$((count+1))
+			first=$p
+		done
+		if [ "$count" -eq 1 ] && [ -d "$first" ]; then
+			SRC_DIR=$first
+		else
+			SRC_DIR=$d
+		fi
+	fi
+	[ -d "$SRC_DIR" ] || die "source dir not found after unpack: $SRC_DIR"
 }
 
 # =========================
 # Build pipeline
 # =========================
-export_env() {
-    # Provide standard build env vars
-    export DESTDIR="$STAGE_DIR"
-    export PREFIX="$XBUILD_PREFIX"
-    export ROOTFS="$XBUILD_ROOTFS"
-    export MAKEFLAGS="-j$XBUILD_JOBS"
-}
 
 do_build() {
-    # Create dirs
-    SRC_ARCHIVE="$XBUILD_SOURCES/$PKG_ARCHIVE"
-    [ -f "$SRC_ARCHIVE" ] || die "missing source archive, run fetch first: $RECIPE_REF"
+	SRC_ARCHIVE="$XBUILD_SOURCES/$PKG_ARCHIVE"
+	[ -f "$SRC_ARCHIVE" ] || die "missing source archive, run fetch first: $RECIPE_REF"
 
-    BUILD_DIR="$XBUILD_BUILDDIR/$PKG_ID"
-    STAGE_DIR="$XBUILD_STAGING/$PKG_ID"
+	BUILD_DIR="$XBUILD_BUILDDIR/$PKG_ID"
+	STAGE_DIR="$XBUILD_STAGING/$PKG_ID"
 
-    # Clean build/stage unless force keep
-    if [ "$XBUILD_FORCE" = "1" ]; then
-        safe_rm_rf "$BUILD_DIR" 2>/dev/null || :
-        safe_rm_rf "$STAGE_DIR" 2>/dev/null || :
-    fi
-    mkdir_p "$BUILD_DIR"
-    mkdir_p "$STAGE_DIR"
+	if [ "$XBUILD_FORCE" = "1" ]; then
+		safe_rm_rf "$BUILD_DIR" 2>/dev/null || :
+		safe_rm_rf "$STAGE_DIR" 2>/dev/null || :
+	fi
+	mkdir_p "$BUILD_DIR"
+	mkdir_p "$STAGE_DIR"
 
-    # Unpack into build dir
-    unpack_source "$SRC_ARCHIVE" "$BUILD_DIR/src"
+	unpack_source "$SRC_ARCHIVE" "$BUILD_DIR/src"
+	export_env
 
-    export_env
+	LOG="$XBUILD_LOGS/$PKG_ID/build.log"
+	mkdir_p "$(dirname "$LOG")"
 
-    LOG="$XBUILD_LOGS/$PKG_ID/build.log"
+	if command -v pkg_prepare >/dev/null 2>&1; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && pkg_prepare" sh "$SRC_DIR"
+	fi
 
-    # Optional hook
-    if command -v pkg_prepare >/dev/null 2>&1; then
-        ( cd "$SRC_DIR" && pkg_prepare ) >>"$LOG" 2>&1 || die "pkg_prepare failed (log: $LOG)"
-    fi
+	if command -v pkg_configure >/dev/null 2>&1; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && pkg_configure" sh "$SRC_DIR"
+	elif [ -n "${PKG_CONFIGURE:-}" ]; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && $PKG_CONFIGURE" sh "$SRC_DIR"
+	fi
 
-    if command -v pkg_configure >/dev/null 2>&1; then
-        ( cd "$SRC_DIR" && pkg_configure ) >>"$LOG" 2>&1 || die "pkg_configure failed (log: $LOG)"
-    elif [ -n "${PKG_CONFIGURE:-}" ]; then
-        ( cd "$SRC_DIR" && sh -c "$PKG_CONFIGURE" ) >>"$LOG" 2>&1 || die "configure failed (log: $LOG)"
-    fi
-
-    if command -v pkg_build >/dev/null 2>&1; then
-        ( cd "$SRC_DIR" && pkg_build ) >>"$LOG" 2>&1 || die "pkg_build failed (log: $LOG)"
-    elif [ -n "${PKG_BUILD:-}" ]; then
-        ( cd "$SRC_DIR" && sh -c "$PKG_BUILD" ) >>"$LOG" 2>&1 || die "build failed (log: $LOG)"
-    else
-        # Conventional default
-        if [ -f "$SRC_DIR/Makefile" ] || [ -f "$SRC_DIR/makefile" ]; then
-            ( cd "$SRC_DIR" && make -j"$XBUILD_JOBS" ) >>"$LOG" 2>&1 || die "make failed (log: $LOG)"
-        fi
-    fi
+	if command -v pkg_build >/dev/null 2>&1; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && pkg_build" sh "$SRC_DIR"
+	elif [ -n "${PKG_BUILD:-}" ]; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && $PKG_BUILD" sh "$SRC_DIR"
+	else
+		if [ -f "$SRC_DIR/Makefile" ] || [ -f "$SRC_DIR/makefile" ]; then
+			run_strict "$LOG" sh -c "cd \"\$1\" && make -j\"$XBUILD_JOBS\"" sh "$SRC_DIR"
+		fi
+	fi
 }
 
 do_stage_install() {
-    STAGE_DIR="$XBUILD_STAGING/$PKG_ID"
-    BUILD_DIR="$XBUILD_BUILDDIR/$PKG_ID"
-    SRC_DIR="$BUILD_DIR/src"
-    [ -d "$SRC_DIR" ] || die "missing source dir, run build first: $RECIPE_REF"
-    mkdir_p "$STAGE_DIR"
+	STAGE_DIR="$XBUILD_STAGING/$PKG_ID"
+	BUILD_DIR="$XBUILD_BUILDDIR/$PKG_ID"
+	SRC_DIR="$BUILD_DIR/src"
+	[ -d "$SRC_DIR" ] || die "missing source dir, run build first: $RECIPE_REF"
+	mkdir_p "$STAGE_DIR"
 
-    export_env
-    LOG="$XBUILD_LOGS/$PKG_ID/install.log"
+	export_env
+	LOG="$XBUILD_LOGS/$PKG_ID/install.log"
+	mkdir_p "$(dirname "$LOG")"
 
-    # Ensure stage is empty unless force
-    if [ "$XBUILD_FORCE" = "1" ]; then
-        safe_rm_rf "$STAGE_DIR" 2>/dev/null || :
-        mkdir_p "$STAGE_DIR"
-    fi
+	if [ "$XBUILD_FORCE" = "1" ]; then
+		safe_rm_rf "$STAGE_DIR" 2>/dev/null || :
+		mkdir_p "$STAGE_DIR"
+	fi
 
-    if command -v pkg_install >/dev/null 2>&1; then
-        ( cd "$SRC_DIR" && pkg_install ) >>"$LOG" 2>&1 || die "pkg_install failed (log: $LOG)"
-    elif [ -n "${PKG_INSTALL:-}" ]; then
-        ( cd "$SRC_DIR" && sh -c "$PKG_INSTALL" ) >>"$LOG" 2>&1 || die "install failed (log: $LOG)"
-    else
-        # Conventional default
-        if [ -f "$SRC_DIR/Makefile" ] || [ -f "$SRC_DIR/makefile" ]; then
-            ( cd "$SRC_DIR" && make DESTDIR="$STAGE_DIR" PREFIX="$XBUILD_PREFIX" install ) >>"$LOG" 2>&1 || die "make install failed (log: $LOG)"
-        else
-            die "no install method defined for $RECIPE_REF (set PKG_INSTALL or define pkg_install())"
-        fi
-    fi
+	if command -v pkg_install >/dev/null 2>&1; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && pkg_install" sh "$SRC_DIR"
+	elif [ -n "${PKG_INSTALL:-}" ]; then
+		run_strict "$LOG" sh -c "cd \"\$1\" && $PKG_INSTALL" sh "$SRC_DIR"
+	else
+		if [ -f "$SRC_DIR/Makefile" ] || [ -f "$SRC_DIR/makefile" ]; then
+			run_strict "$LOG" sh -c "cd \"\$1\" && make DESTDIR=\"\$2\" PREFIX=\"\$3\" install" sh "$SRC_DIR" "$STAGE_DIR" "$XBUILD_PREFIX"
+		else
+			die "no install method defined for $RECIPE_REF (set PKG_INSTALL or define pkg_install())"
+		fi
+	fi
 }
 
 manifest_write() {
-    # manifest_write <stagedir> <outfile>
-    sd=$1
-    out=$2
-    [ -d "$sd" ] || die "manifest_write: missing stagedir: $sd"
-    mkdir_p "$(dirname "$out")"
-    # Record files and symlinks; directories are reconstructed automatically.
-    ( cd "$sd" && find . \( -type f -o -type l \) -print | LC_ALL=C sort ) >"$out" || die "cannot write manifest: $out"
+	sd=$1
+	out=$2
+	[ -d "$sd" ] || die "manifest_write: missing stagedir: $sd"
+	mkdir_p "$(dirname "$out")"
+	( cd "$sd" && find . \( -type f -o -type l \) -print | LC_ALL=C sort ) >"$out" || die "cannot write manifest: $out"
 }
 
 collision_check() {
-    # collision_check <manifest>
-    mf=$1
-    [ -f "$mf" ] || die "collision_check: missing manifest: $mf"
-    while IFS= read -r rel; do
-        [ -n "$rel" ] || continue
-        rel=${rel#./}
-        [ -n "$rel" ] || continue
-        # Only allow inside prefix when strict.
-        if [ "$XBUILD_STRICT" = "1" ]; then
-            case "$XBUILD_PREFIX" in
-                /) : ;;
-                *)
-                    case "/$rel" in
-                        "$XBUILD_PREFIX"/*) : ;;
-                        *) die "manifest entry escapes prefix (strict): $rel" ;;
-                    esac
-                    ;;
-            esac
-        fi
-        dest="$XBUILD_ROOTFS/$rel"
-        if [ -e "$dest" ] && [ "$XBUILD_FORCE" != "1" ]; then
-            die "collision detected: $dest already exists (use XBUILD_FORCE=1 to override)"
-        fi
-    done <"$mf"
+	mf=$1
+	[ -f "$mf" ] || die "collision_check: missing manifest: $mf"
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		rel=${rel#./}
+		[ -n "$rel" ] || continue
+
+		if [ "$XBUILD_STRICT" = "1" ]; then
+			case "$XBUILD_PREFIX" in
+				/) : ;;
+				*)
+					case "/$rel" in
+						"$XBUILD_PREFIX"/*) : ;;
+						*) die "manifest entry escapes prefix (strict): $rel" ;;
+					esac
+					;;
+			esac
+		fi
+
+		dest="$XBUILD_ROOTFS/$rel"
+		if [ -e "$dest" ] && [ "$XBUILD_FORCE" != "1" ]; then
+			die "collision detected: $dest already exists (use XBUILD_FORCE=1 to override)"
+		fi
+	done <"$mf"
+}
+
+_copy_symlink_target() {
+	# best-effort readlink fallback
+	src=$1
+	if command -v readlink >/dev/null 2>&1; then
+		readlink "$src" 2>/dev/null && return 0
+	fi
+	# fallback: parse `ls -ld` output (not perfect, but better than nothing)
+	ls -ld "$src" 2>/dev/null | sed 's/^.* -> //' | awk '{print $0}'
 }
 
 copy_to_rootfs_by_manifest() {
-    # copy_to_rootfs_by_manifest <stagedir> <manifest>
-    sd=$1
-    mf=$2
-    [ -d "$sd" ] || die "missing stagedir: $sd"
-    [ -f "$mf" ] || die "missing manifest: $mf"
-    while IFS= read -r rel; do
-        [ -n "$rel" ] || continue
-        rel=${rel#./}
-        [ -n "$rel" ] || continue
-        src="$sd/$rel"
-        dst="$XBUILD_ROOTFS/$rel"
+	sd=$1
+	mf=$2
+	[ -d "$sd" ] || die "copy: missing stagedir: $sd"
+	[ -f "$mf" ] || die "copy: missing manifest: $mf"
 
-        # Ensure destination directory exists
-        dstdir=$(dirname "$dst")
-        mkdir_p "$dstdir"
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		rel=${rel#./}
+		[ -n "$rel" ] || continue
 
-        if [ -L "$src" ]; then
-            # replicate symlink target
-            tgt=$(readlink "$src" 2>/dev/null || echo "")
-            [ -n "$tgt" ] || die "cannot readlink: $src"
-            rm -f "$dst" 2>/dev/null || :
-            ln -s "$tgt" "$dst" || die "failed to create symlink: $dst -> $tgt"
-        else
-            # regular file
-            cp -f "$src" "$dst" || die "failed to copy: $src -> $dst"
-        fi
-    done <"$mf"
+		src="$sd/$rel"
+		dst="$XBUILD_ROOTFS/$rel"
+
+		mkdir_p "$(dirname "$dst")"
+
+		if [ -L "$src" ]; then
+			tgt=$(_copy_symlink_target "$src")
+			[ -n "$tgt" ] || die "cannot read symlink target: $src"
+			rm -f "$dst" 2>/dev/null || :
+			ln -s "$tgt" "$dst" || die "failed to create symlink: $dst -> $tgt"
+		else
+			# preserve permissions when possible
+			if cp -p "$src" "$dst" >/dev/null 2>&1; then
+				:
+			else
+				cp -f "$src" "$dst" || die "failed to copy: $src -> $dst"
+			fi
+		fi
+	done <"$mf"
 }
 
 register_and_finalize() {
-    # register_and_finalize <manifest> <recipe_file>
-    mf=$1
-    rf=$2
-    [ -f "$mf" ] || die "missing manifest: $mf"
-    [ -f "$rf" ] || die "missing recipe file: $rf"
+	mf=$1
+	rf=$2
+	[ -f "$mf" ] || die "missing manifest: $mf"
+	[ -f "$rf" ] || die "missing recipe file: $rf"
 
-    pkgdir="$XBUILD_DB/$PKG_ID"
-    if [ -d "$pkgdir" ] && [ "$XBUILD_FORCE" != "1" ]; then
-        die "package already installed: $PKG_ID (use remove or XBUILD_FORCE=1)"
-    fi
-    safe_rm_rf "$pkgdir" 2>/dev/null || :
-    mkdir_p "$pkgdir"
+	pkgdir="$XBUILD_DB/$PKG_ID"
+	if [ -d "$pkgdir" ] && [ "$XBUILD_FORCE" != "1" ]; then
+		die "package already installed: $PKG_ID (use remove or XBUILD_FORCE=1)"
+	fi
+	safe_rm_rf "$pkgdir" 2>/dev/null || :
+	mkdir_p "$pkgdir"
 
-    cp -f "$mf" "$pkgdir/manifest" || die "cannot write db manifest"
-    cp -f "$rf" "$pkgdir/recipe.sh" 2>/dev/null || :
-    printf '%s\n' "$RECIPE_REF" >"$pkgdir/recipe_ref" 2>/dev/null || :
-    printf '%s\n' "$(now_utc)" >"$pkgdir/installed_at" 2>/dev/null || :
+	cp -f "$mf" "$pkgdir/manifest" || die "cannot write db manifest"
+	cp -f "$rf" "$pkgdir/recipe.sh" 2>/dev/null || :
+	printf '%s\n' "$RECIPE_REF" >"$pkgdir/recipe_ref" 2>/dev/null || :
+	printf '%s\n' "$(now_utc)" >"$pkgdir/installed_at" 2>/dev/null || :
 
-    msg "installed: $PKG_ID"
+	msg "installed: $PKG_ID"
 }
 
-pkg_installed() {
-    # pkg_installed <pkgid>
-    [ -d "$XBUILD_DB/$1" ]
-}
+pkg_installed() { [ -d "$XBUILD_DB/$1" ]; }
 
 do_remove_pkgid() {
-    # do_remove_pkgid <pkgid>
-    id=$1
-    pkgdir="$XBUILD_DB/$id"
-    [ -d "$pkgdir" ] || die "not installed: $id"
-    mf="$pkgdir/manifest"
-    [ -f "$mf" ] || die "missing manifest for installed pkg: $id"
+	id=$1
+	pkgdir="$XBUILD_DB/$id"
+	[ -d "$pkgdir" ] || die "not installed: $id"
+	mf="$pkgdir/manifest"
+	[ -f "$mf" ] || die "missing manifest for installed pkg: $id"
 
-    if [ "$XBUILD_FORCE" != "1" ]; then
-        confirm "Remove package $id from rootfs $XBUILD_ROOTFS?" || die "aborted"
-    fi
+	if [ "$XBUILD_FORCE" != "1" ]; then
+		confirm "Remove package $id from rootfs $XBUILD_ROOTFS?" || die "aborted"
+	fi
 
-    # Remove files/symlinks
-    # Reverse sort so deeper paths removed first (helps with empty dirs later)
-    tmp="$XBUILD_TMPDIR/manifest.sorted"
-    ( awk '{print}' "$mf" | LC_ALL=C sort -r ) >"$tmp" || die "cannot sort manifest"
+	tmp="$XBUILD_TMPDIR/manifest.sorted"
+	( awk '{print}' "$mf" | LC_ALL=C sort -r ) >"$tmp" || die "cannot sort manifest"
 
-    while IFS= read -r rel; do
-        [ -n "$rel" ] || continue
-        rel=${rel#./}
-        [ -n "$rel" ] || continue
-        dst="$XBUILD_ROOTFS/$rel"
+	while IFS= read -r rel; do
+		[ -n "$rel" ] || continue
+		rel=${rel#./}
+		[ -n "$rel" ] || continue
+		dst="$XBUILD_ROOTFS/$rel"
 
-        # Strict safety: refuse outside rootfs
-        case "$dst" in
-            "$XBUILD_ROOTFS"/*) : ;;
-            *) die "refusing to remove outside rootfs: $dst" ;;
-        esac
+		case "$dst" in
+			"$XBUILD_ROOTFS"/*) : ;;
+			*) die "refusing to remove outside rootfs: $dst" ;;
+		esac
 
-        if [ -L "$dst" ] || [ -f "$dst" ]; then
-            rm -f "$dst" || die "failed to remove: $dst"
-        fi
-    done <"$tmp"
+		if [ -L "$dst" ] || [ -f "$dst" ]; then
+			rm -f "$dst" || die "failed to remove: $dst"
+		fi
+	done <"$tmp"
 
-    # Attempt to prune empty directories within prefix
-    if [ "$XBUILD_STRICT" = "1" ]; then
-        # Only prune within prefix path under rootfs
-        pr="$XBUILD_ROOTFS${XBUILD_PREFIX%/}"
-        if [ -d "$pr" ]; then
-            # Find dirs and remove empties; ignore failures
-            find "$pr" -type d -print 2>/dev/null | LC_ALL=C sort -r | while IFS= read -r d; do
-                rmdir "$d" 2>/dev/null || :
-            done
-        fi
-    fi
+	if [ "$XBUILD_STRICT" = "1" ]; then
+		pr="$XBUILD_ROOTFS${XBUILD_PREFIX%/}"
+		if [ -d "$pr" ]; then
+			find "$pr" -type d -print 2>/dev/null | LC_ALL=C sort -r | while IFS= read -r d; do
+				rmdir "$d" 2>/dev/null || :
+			done
+		fi
+	fi
 
-    safe_rm_rf "$pkgdir" || die "failed to remove db entry: $pkgdir"
-    msg "removed: $id"
+	safe_rm_rf "$pkgdir" || die "failed to remove db entry: $pkgdir"
+	msg "removed: $id"
 }
 
 # =========================
 # Commands
 # =========================
+
 cmd_fetch() {
-    mkdir_p "$XBUILD_SOURCES"
-    out="$XBUILD_SOURCES/$PKG_ARCHIVE"
-    if [ -f "$out" ] && [ "$XBUILD_FORCE" != "1" ]; then
-        msg "source already present: $out"
-        sha256_check "$out" "$PKG_SHA256"
-        return 0
-    fi
-    msg "fetching: $PKG_URL"
-    download_file "$PKG_URL" "$out"
-    sha256_check "$out" "$PKG_SHA256"
-    msg "fetched: $out"
+	mkdir_p "$XBUILD_SOURCES"
+	out="$XBUILD_SOURCES/$PKG_ARCHIVE"
+	if [ -f "$out" ] && [ "$XBUILD_FORCE" != "1" ]; then
+		msg "source already present: $out"
+		sha256_check "$out" "$PKG_SHA256"
+		return 0
+	fi
+	msg "fetching: $PKG_URL"
+	download_file "$PKG_URL" "$out"
+	sha256_check "$out" "$PKG_SHA256"
+	msg "fetched: $out"
 }
 
 cmd_build() {
-    do_build
-    msg "build done: $PKG_ID"
-    if [ "$XBUILD_KEEP_BUILD" != "1" ]; then
-        : # keep by default until clean; do not auto-delete in 1.0
-    fi
+	do_build
+	msg "build done: $PKG_ID"
 }
 
 cmd_install() {
-    # Build if needed
-    if [ ! -d "$XBUILD_BUILDDIR/$PKG_ID/src" ]; then
-        do_build
-    fi
-    do_stage_install
+	if [ ! -d "$XBUILD_BUILDDIR/$PKG_ID/src" ]; then
+		do_build
+	fi
+	do_stage_install
 
-    mf="$XBUILD_TMPDIR/$PKG_ID.manifest"
-    manifest_write "$XBUILD_STAGING/$PKG_ID" "$mf"
-    collision_check "$mf"
-    copy_to_rootfs_by_manifest "$XBUILD_STAGING/$PKG_ID" "$mf"
-    register_and_finalize "$mf" "$RECIPE_FILE"
+	xbuild_prepare_tmpdir
+	mf="$XBUILD_TMPDIR/$PKG_ID.manifest"
+	manifest_write "$XBUILD_STAGING/$PKG_ID" "$mf"
+	collision_check "$mf"
+	copy_to_rootfs_by_manifest "$XBUILD_STAGING/$PKG_ID" "$mf"
+	register_and_finalize "$mf" "$RECIPE_FILE"
 
-    if [ "$XBUILD_KEEP_BUILD" != "1" ]; then
-        : # user can `clean` later
-    fi
+	if [ "$XBUILD_KEEP_BUILD" != "1" ]; then
+		: # keep by default
+	fi
 }
 
 cmd_clean() {
-    b="$XBUILD_BUILDDIR/$PKG_ID"
-    s="$XBUILD_STAGING/$PKG_ID"
-    if [ -d "$b" ]; then safe_rm_rf "$b"; msg "cleaned build: $b"; fi
-    if [ -d "$s" ]; then safe_rm_rf "$s"; msg "cleaned staging: $s"; fi
+	b="$XBUILD_BUILDDIR/$PKG_ID"
+	s="$XBUILD_STAGING/$PKG_ID"
+	[ -d "$b" ] && { safe_rm_rf "$b"; msg "cleaned build: $b"; }
+	[ -d "$s" ] && { safe_rm_rf "$s"; msg "cleaned staging: $s"; }
 }
 
 cmd_list() {
-    mkdir_p "$XBUILD_DB"
-    if ! ls "$XBUILD_DB" >/dev/null 2>&1; then
-        msg "(no packages installed)"
-        return 0
-    fi
-    # One pkg per line
-    for d in "$XBUILD_DB"/*; do
-        [ -d "$d" ] || continue
-        id=$(basename "$d")
-        inst=""
-        [ -f "$d/installed_at" ] && inst=$(cat "$d/installed_at" 2>/dev/null || echo "")
-        ref=""
-        [ -f "$d/recipe_ref" ] && ref=$(cat "$d/recipe_ref" 2>/dev/null || echo "")
-        printf '%s\t%s\t%s\n' "$id" "$inst" "$ref"
-    done | LC_ALL=C sort
+	mkdir_p "$XBUILD_DB"
+	if ! ls "$XBUILD_DB" >/dev/null 2>&1; then
+		msg "(no packages installed)"
+		return 0
+	fi
+	for d in "$XBUILD_DB"/*; do
+		[ -d "$d" ] || continue
+		id=$(basename "$d")
+		inst=""
+		[ -f "$d/installed_at" ] && inst=$(cat "$d/installed_at" 2>/dev/null || echo "")
+		ref=""
+		[ -f "$d/recipe_ref" ] && ref=$(cat "$d/recipe_ref" 2>/dev/null || echo "")
+		printf '%s\t%s\t%s\n' "$id" "$inst" "$ref"
+	done | LC_ALL=C sort
 }
 
 cmd_info() {
-    id="$PKG_ID"
-    if pkg_installed "$id"; then
-        pkgdir="$XBUILD_DB/$id"
-        msg "PKG_ID: $id"
-        [ -f "$pkgdir/installed_at" ] && msg "Installed: $(cat "$pkgdir/installed_at" 2>/dev/null || echo "")"
-        [ -f "$pkgdir/recipe_ref" ] && msg "Recipe: $(cat "$pkgdir/recipe_ref" 2>/dev/null || echo "")"
-        [ -f "$pkgdir/manifest" ] && msg "Files: $(wc -l <"$pkgdir/manifest" 2>/dev/null || echo "?")"
-        return 0
-    fi
-    # Not installed: show recipe details
-    msg "Recipe: $RECIPE_REF"
-    msg "PKG_ID: $PKG_ID"
-    msg "URL: $PKG_URL"
-    msg "SHA256: $PKG_SHA256"
-    msg "ARCHIVE: $PKG_ARCHIVE"
+	id="$PKG_ID"
+	if pkg_installed "$id"; then
+		pkgdir="$XBUILD_DB/$id"
+		msg "PKG_ID: $id"
+		[ -f "$pkgdir/installed_at" ] && msg "Installed: $(cat "$pkgdir/installed_at" 2>/dev/null || echo "")"
+		[ -f "$pkgdir/recipe_ref" ] && msg "Recipe: $(cat "$pkgdir/recipe_ref" 2>/dev/null || echo "")"
+	else
+		msg "PKG_ID: $id (not installed)"
+	fi
+	msg "Recipe: $RECIPE_REF"
+	msg "URL: $PKG_URL"
+	msg "SHA256: $PKG_SHA256"
+	msg "ARCHIVE: $PKG_ARCHIVE"
 }
 
 # =========================
 # Argument parsing & main
 # =========================
+
 parse_args() {
-    [ $# -ge 1 ] || { usage; exit 1; }
-    c=$1; shift
-    case "$c" in
-        fetch|f)   CMD=fetch ;;
-        build|b)   CMD=build ;;
-        install|i) CMD=install ;;
-        remove|r)  CMD=remove ;;
-        list|ls)   CMD=list ;;
-        info|in)   CMD=info ;;
-        clean|cl)  CMD=clean ;;
-        help|h|-h|--help) usage; exit 0 ;;
-        *) die "unknown command: $c (use: xbuild help)" ;;
-    esac
+	[ $# -ge 1 ] || { usage; exit 1; }
+	c=$1; shift
+	case "$c" in
+		fetch|f)   CMD=fetch ;;
+		build|b)   CMD=build ;;
+		install|i) CMD=install ;;
+		remove|r)  CMD=remove ;;
+		list|ls)   CMD=list ;;
+		info|in)   CMD=info ;;
+		clean|cl)  CMD=clean ;;
+		help|h|-h|--help) usage; exit 0 ;;
+		*) die "unknown command: $c (use: xbuild help)" ;;
+	esac
 
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -R|--rootfs) shift; [ $# -gt 0 ] || die "missing arg for --rootfs"; XBUILD_ROOTFS=$1 ;;
-            -P|--prefix) shift; [ $# -gt 0 ] || die "missing arg for --prefix"; XBUILD_PREFIX=$1 ;;
-            -r|--recipes) shift; [ $# -gt 0 ] || die "missing arg for --recipes"; XBUILD_RECIPES=$1 ;;
-            -j|--jobs) shift; [ $# -gt 0 ] || die "missing arg for --jobs"; XBUILD_JOBS=$1 ;;
-            -k|--keep-build) XBUILD_KEEP_BUILD=1 ;;
-            -y|--yes) XBUILD_ASSUME_YES=1 ;;
-            -q|--quiet) QUIET=1 ;;
-            -v|--verbose) VERBOSE=1 ;;
-            --) shift; break ;;
-            -*) die "unknown option: $1" ;;
-            *) break ;;
-        esac
-        shift
-    done
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-R|--rootfs)  shift; [ $# -gt 0 ] || die "missing arg for --rootfs"; XBUILD_ROOTFS=$1 ;;
+			-P|--prefix)  shift; [ $# -gt 0 ] || die "missing arg for --prefix"; XBUILD_PREFIX=$1 ;;
+			-r|--recipes) shift; [ $# -gt 0 ] || die "missing arg for --recipes"; XBUILD_RECIPES=$1 ;;
+			-j|--jobs)    shift; [ $# -gt 0 ] || die "missing arg for --jobs"; XBUILD_JOBS=$1 ;;
+			-k|--keep-build) XBUILD_KEEP_BUILD=1 ;;
+			-y|--yes)     XBUILD_ASSUME_YES=1 ;;
+			-q|--quiet)   QUIET=1 ;;
+			-v|--verbose) VERBOSE=1 ;;
+			--) shift; break ;;
+			-*) die "unknown option: $1" ;;
+			*) break ;;
+		esac
+		shift
+	done
 
-    if [ "$CMD" = "list" ]; then
-        return 0
-    fi
+	if [ "$CMD" = "list" ]; then
+		return 0
+	fi
 
-    [ $# -ge 1 ] || die "missing package argument"
-    PKGARG=$1
+	[ $# -ge 1 ] || die "missing package argument"
+	PKGARG=$1
 }
 
 main() {
-    parse_args "$@"
-    paths_init
-    lock_acquire
+	parse_args "$@"
+	paths_init
+	lock_acquire
 
-    if [ "$CMD" = "list" ]; then
-        cmd_list
-        return 0
-    fi
+	if [ "$CMD" = "list" ]; then
+		cmd_list
+		return 0
+	fi
 
-    # remove can work with pkgid even if recipe missing
-    if [ "$CMD" = "remove" ]; then
-        mkdir_p "$XBUILD_DB"
-        xbuild_prepare_tmpdir
-        if pkg_installed "$PKGARG"; then
-            do_remove_pkgid "$PKGARG"
-            return 0
-        fi
-        # Else treat as recipe ref/name
-        [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
-        RECIPE_FILE=$(recipe_find "$PKGARG")
-        recipe_load "$RECIPE_FILE"
-        do_remove_pkgid "$PKG_ID"
-        return 0
-    fi
+	if [ "$CMD" = "remove" ]; then
+		mkdir_p "$XBUILD_DB"
+		xbuild_prepare_tmpdir
+		if pkg_installed "$PKGARG"; then
+			do_remove_pkgid "$PKGARG"
+			return 0
+		fi
+		[ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
+		RECIPE_FILE=$(recipe_find "$PKGARG")
+		recipe_load "$RECIPE_FILE"
+		do_remove_pkgid "$PKG_ID"
+		return 0
+	fi
 
-    [ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
-    RECIPE_FILE=$(recipe_find "$PKGARG")
-    recipe_load "$RECIPE_FILE"
+	[ -d "$XBUILD_RECIPES" ] || die "recipes dir not found: $XBUILD_RECIPES"
+	RECIPE_FILE=$(recipe_find "$PKGARG")
+	recipe_load "$RECIPE_FILE"
 
-    case "$CMD" in
-        fetch)   cmd_fetch ;;
-        build)   cmd_build ;;
-        install) cmd_install ;;
-        clean)   cmd_clean ;;
-        info)    cmd_info ;;
-        *) die "internal: unhandled command: $CMD" ;;
-    esac
+	case "$CMD" in
+		fetch)   cmd_fetch ;;
+		build)   cmd_build ;;
+		install) cmd_install ;;
+		clean)   cmd_clean ;;
+		info)    cmd_info ;;
+		*) die "internal: unhandled command: $CMD" ;;
+	esac
 }
 
 main "$@"
